@@ -1,0 +1,57 @@
+{
+  "name": "tcf-tef-comprehensive-tests",
+  "version": "1.0.0",
+  "description": "Comprehensive test suite for TCF/TEF Learning Platform",
+  "main": "master-test-runner.js",
+  "scripts": {
+    "test": "node master-test-runner.js",
+    "test:roles": "node role-based-tests.js",
+    "test:transactions": "node transaction-tests.js",
+    "test:live-sessions": "node live-session-tests.js",
+    "test:admin": "node role-based-tests.js --role=admin",
+    "test:manager": "node role-based-tests.js --role=manager",
+    "test:student": "node role-based-tests.js --role=student",
+    "test:payments": "node transaction-tests.js --focus=payments",
+    "test:security": "node security-tests.js",
+    "test:performance": "node performance-tests.js",
+    "test:integration": "node integration-tests.js",
+    "test:all": "npm run test",
+    "test:quick": "node quick-smoke-tests.js",
+    "test:verbose": "DEBUG=* node master-test-runner.js",
+    "test:report": "node master-test-runner.js > test-report.txt 2>&1"
+  },
+  "dependencies": {
+    "axios": "^1.12.0",
+    "colors": "^1.4.0",
+    "dotenv": "^16.0.0"
+  },
+  "devDependencies": {
+    "jest": "^29.0.0",
+    "supertest": "^6.3.0"
+  },
+  "keywords": [
+    "tcf",
+    "tef",
+    "french",
+    "learning",
+    "platform",
+    "testing",
+    "comprehensive",
+    "role-based",
+    "transactions",
+    "live-sessions"
+  ],
+  "author": "TCF/TEF Platform Team",
+  "license": "MIT",
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/your-org/tcf-tef-backend.git"
+  },
+  "bugs": {
+    "url": "https://github.com/your-org/tcf-tef-backend/issues"
+  },
+  "homepage": "https://github.com/your-org/tcf-tef-backend#readme"
+}

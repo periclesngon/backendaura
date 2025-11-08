@@ -1,0 +1,536 @@
+import express, { Request, Response, NextFunction } from 'express';
+import { authenticate } from '../middleware/auth';
+import { NotificationService } from '../services/notificationService';
+
+const router = express.Router();
+
+// Workaround for Prisma client TypeScript issues
+const { PrismaClient } = require('@prisma/client');
+const prisma = new PrismaClient();
+
+/**
+ * @route GET /api/messages/unread-count
+ * @desc Get unread message count
+ * @access Private
+ * NOTE: This route MUST come before the GET / route to avoid route matching issues
+ */
+router.get('/unread-count', authenticate, async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const userId = req.user!.userId;
+
+    const count = await prisma.message.count({
+      where: {
+        receiverId: userId,
+        isRead: false
+      }
+    });
+
+    res.json({
+      success: true,
+      data: { count }
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * @route GET /api/messages
+ * @desc Get user messages (inbox)
+ * @access Private
+ */
+router.get('/', authenticate, async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const userId = req.user!.userId;
+    const { page = 1, limit = 20, type = 'received' } = req.query;
+
+    const where = type === 'sent' 
+      ? { senderId: userId }
+      : { receiverId: userId };
+
+    const messages = await prisma.message.findMany({
+      where,
+      include: {
+        sender: {
+          select: {
+            id: true,
+            firstName: true,
+            lastName: true,
+            email: true,
+            role: true,
+            profileImage: true
+          }
+        },
+        receiver: {
+          select: {
+            id: true,
+            firstName: true,
+            lastName: true,
+            email: true,
+            role: true,
+            profileImage: true
+          }
+        }
+      },
+      orderBy: { createdAt: 'desc' },
+      take: parseInt(limit as string),
+      skip: (parseInt(page as string) - 1) * parseInt(limit as string)
+    });
+
+    const totalCount = await prisma.message.count({ where });
+    const unreadCount = await prisma.message.count({
+      where: { ...where, isRead: false }
+    });
+
+    res.json({
+      success: true,
+      data: {
+        messages,
+        pagination: {
+          page: parseInt(page as string),
+          limit: parseInt(limit as string),
+          total: totalCount,
+          pages: Math.ceil(totalCount / parseInt(limit as string))
+        },
+        unreadCount
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * @route POST /api/messages
+ * @desc Send a new message
+ * @access Private
+ */
+router.post('/', authenticate, async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const senderId = req.user!.userId;
+    const { receiverId, subject, content, parentId, attachments } = req.body;
+
+    // Verify receiver exists
+    const receiver = await prisma.user.findUnique({
+      where: { id: receiverId }
+    });
+
+    if (!receiver) {
+      return res.status(404).json({
+        success: false,
+        error: { message: 'Receiver not found' }
+      });
+    }
+
+    const message = await prisma.message.create({
+      data: {
+        senderId,
+        receiverId,
+        subject,
+        content,
+        parentId,
+        attachments
+      },
+      include: {
+        sender: {
+          select: {
+            id: true,
+            firstName: true,
+            lastName: true,
+            role: true
+          }
+        },
+        receiver: {
+          select: {
+            id: true,
+            firstName: true,
+            lastName: true,
+            email: true,
+            role: true
+          }
+        }
+      }
+    });
+
+    // Create notification for receiver
+    await NotificationService.sendSystemNotification(
+      receiverId,
+      `Nouveau message de ${message.sender.firstName} ${message.sender.lastName}`,
+      subject || content.substring(0, 100) + '...',
+      'INFO',
+      {
+        messageId: message.id,
+        senderId: senderId,
+        actionUrl: `/messages/${message.id}`
+      }
+    );
+
+    res.json({
+      success: true,
+      data: message,
+      message: 'Message sent successfully'
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+
+/**
+ * @route GET /api/messages/contacts
+ * @desc Get available contacts (users to message)
+ * @access Private
+ */
+router.get('/contacts', authenticate, async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const userId = req.user!.userId;
+    const { search, role } = req.query;
+
+    const user = await prisma.user.findUnique({
+      where: { id: userId }
+    });
+
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        error: { message: 'User not found' }
+      });
+    }
+
+    // Define who can message whom
+    let allowedRoles: string[] = [];
+    
+    if (user.role === 'STUDENT' || user.role === 'USER') {
+      allowedRoles = ['ADMIN', 'SENIOR_MANAGER', 'JUNIOR_MANAGER'];
+    } else if (user.role === 'JUNIOR_MANAGER') {
+      allowedRoles = ['ADMIN', 'SENIOR_MANAGER', 'STUDENT'];
+    } else if (user.role === 'SENIOR_MANAGER') {
+      allowedRoles = ['ADMIN', 'JUNIOR_MANAGER', 'STUDENT'];
+    } else if (user.role === 'ADMIN') {
+      allowedRoles = ['SENIOR_MANAGER', 'JUNIOR_MANAGER', 'STUDENT'];
+    }
+
+    const where: any = {
+      id: { not: userId },
+      role: { in: allowedRoles },
+      status: 'ACTIVE'
+    };
+
+    if (search) {
+      where.OR = [
+        { firstName: { contains: search as string, mode: 'insensitive' } },
+        { lastName: { contains: search as string, mode: 'insensitive' } },
+        { email: { contains: search as string, mode: 'insensitive' } }
+      ];
+    }
+
+    if (role) {
+      where.role = role;
+    }
+
+    const contacts = await prisma.user.findMany({
+      where,
+      select: {
+        id: true,
+        firstName: true,
+        lastName: true,
+        email: true,
+        role: true,
+        profileImage: true,
+        status: true
+      },
+      orderBy: [
+        { role: 'asc' },
+        { firstName: 'asc' }
+      ],
+      take: 50
+    });
+
+    res.json({
+      success: true,
+      data: contacts
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * @route GET /api/messages/:id
+ * @desc Get a specific message
+ * @access Private
+ */
+router.get('/:id', authenticate, async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { id } = req.params;
+    const userId = req.user!.userId;
+
+    const message = await prisma.message.findFirst({
+      where: {
+        id,
+        OR: [
+          { senderId: userId },
+          { receiverId: userId }
+        ]
+      },
+      include: {
+        sender: {
+          select: {
+            id: true,
+            firstName: true,
+            lastName: true,
+            email: true,
+            role: true,
+            profilePicture: true
+          }
+        },
+        receiver: {
+          select: {
+            id: true,
+            firstName: true,
+            lastName: true,
+            email: true,
+            role: true,
+            profilePicture: true
+          }
+        },
+        replies: {
+          include: {
+            sender: {
+              select: {
+                id: true,
+                firstName: true,
+                lastName: true,
+                role: true,
+                profilePicture: true
+              }
+            }
+          },
+          orderBy: { createdAt: 'asc' }
+        }
+      }
+    });
+
+    if (!message) {
+      return res.status(404).json({
+        success: false,
+        error: { message: 'Message not found' }
+      });
+    }
+
+    // Mark as read if user is the receiver
+    if (message.receiverId === userId && !message.isRead) {
+      await prisma.message.update({
+        where: { id },
+        data: { isRead: true }
+      });
+    }
+
+    res.json({
+      success: true,
+      data: message
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * @route POST /api/messages/:id/reply
+ * @desc Reply to a message
+ * @access Private
+ */
+router.post('/:id/reply', authenticate, async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { id } = req.params;
+    const senderId = req.user!.userId;
+    const { content, attachments } = req.body;
+
+    // Get original message
+    const originalMessage = await prisma.message.findFirst({
+      where: {
+        id,
+        OR: [
+          { senderId: senderId },
+          { receiverId: senderId }
+        ]
+      },
+      include: {
+        sender: true,
+        receiver: true
+      }
+    });
+
+    if (!originalMessage) {
+      return res.status(404).json({
+        success: false,
+        error: { message: 'Original message not found' }
+      });
+    }
+
+    // Determine receiver (opposite of sender)
+    const receiverId = originalMessage.senderId === senderId 
+      ? originalMessage.receiverId 
+      : originalMessage.senderId;
+
+    const reply = await prisma.message.create({
+      data: {
+        senderId,
+        receiverId,
+        subject: `Re: ${originalMessage.subject || 'Message'}`,
+        content,
+        parentId: originalMessage.parentId || id,
+        attachments
+      },
+      include: {
+        sender: {
+          select: {
+            id: true,
+            firstName: true,
+            lastName: true,
+            role: true
+          }
+        }
+      }
+    });
+
+    // Create notification for receiver
+    await NotificationService.sendSystemNotification(
+      receiverId,
+      `Réponse de ${reply.sender.firstName} ${reply.sender.lastName}`,
+      content.substring(0, 100) + '...',
+      'INFO',
+      {
+        messageId: reply.id,
+        senderId: senderId,
+        actionUrl: `/messages/${originalMessage.parentId || id}`,
+        isReply: true
+      }
+    );
+
+    res.json({
+      success: true,
+      data: reply,
+      message: 'Reply sent successfully'
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * @route GET /api/messages/contacts
+ * @desc Get available contacts (users to message)
+ * @access Private
+ */
+router.get('/contacts', authenticate, async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const userId = req.user!.userId;
+    const { search, role } = req.query;
+
+    const user = await prisma.user.findUnique({
+      where: { id: userId }
+    });
+
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        error: { message: 'User not found' }
+      });
+    }
+
+    // Define who can message whom
+    let allowedRoles: string[] = [];
+    
+    if (user.role === 'STUDENT' || user.role === 'USER') {
+      allowedRoles = ['ADMIN', 'SENIOR_MANAGER', 'JUNIOR_MANAGER'];
+    } else if (user.role === 'JUNIOR_MANAGER') {
+      allowedRoles = ['ADMIN', 'SENIOR_MANAGER', 'STUDENT'];
+    } else if (user.role === 'SENIOR_MANAGER') {
+      allowedRoles = ['ADMIN', 'JUNIOR_MANAGER', 'STUDENT'];
+    } else if (user.role === 'ADMIN') {
+      allowedRoles = ['SENIOR_MANAGER', 'JUNIOR_MANAGER', 'STUDENT'];
+    }
+
+    const where: any = {
+      id: { not: userId },
+      role: { in: allowedRoles },
+      status: 'ACTIVE'
+    };
+
+    if (search) {
+      where.OR = [
+        { firstName: { contains: search as string, mode: 'insensitive' } },
+        { lastName: { contains: search as string, mode: 'insensitive' } },
+        { email: { contains: search as string, mode: 'insensitive' } }
+      ];
+    }
+
+    if (role) {
+      where.role = role;
+    }
+
+    const contacts = await prisma.user.findMany({
+      where,
+      select: {
+        id: true,
+        firstName: true,
+        lastName: true,
+        email: true,
+        role: true,
+        profileImage: true,
+        status: true
+      },
+      orderBy: [
+        { role: 'asc' },
+        { firstName: 'asc' }
+      ],
+      take: 50
+    });
+
+    res.json({
+      success: true,
+      data: contacts
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * @route PUT /api/messages/:id/read
+ * @desc Mark message as read
+ * @access Private
+ */
+router.put('/:id/read', authenticate, async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { id } = req.params;
+    const userId = req.user!.userId;
+
+    const message = await prisma.message.updateMany({
+      where: {
+        id,
+        receiverId: userId
+      },
+      data: {
+        isRead: true
+      }
+    });
+
+    if (message.count === 0) {
+      return res.status(404).json({
+        success: false,
+        error: { message: 'Message not found' }
+      });
+    }
+
+    res.json({
+      success: true,
+      message: 'Message marked as read'
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+export default router;
