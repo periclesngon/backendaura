@@ -1,5 +1,6 @@
 import { Server as SocketIOServer } from 'socket.io';
 import { createAdapter } from '@socket.io/redis-adapter';
+import Redis from 'ioredis';
 import { MessagingService } from './messagingService';
 import { logger } from '../utils/logger';
 import { redisPubClient, redisSubClient, messageQueueRedis } from '../config/redis';
