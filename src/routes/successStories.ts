@@ -14,9 +14,7 @@ router.get('/', async (req, res) => {
     // Get students with test attempts and calculate their progress
     const students = await prisma.user.findMany({
       where: {
-        role: {
-          in: ['STUDENT', 'USER']
-        },
+        role: 'STUDENT', // Only STUDENT role is valid (USER doesn't exist in UserRole enum)
         status: 'ACTIVE',
         testAttempts: {
           some: {
@@ -46,11 +44,11 @@ router.get('/', async (req, res) => {
           take: 1,
           select: {
             score: true,
-            percentage: true,
             completedAt: true,
             test: {
               select: {
-                level: true
+                level: true,
+                questionCount: true
               }
             }
           }
@@ -81,8 +79,13 @@ router.get('/', async (req, res) => {
         // Determine current level (from latest test or currentLevel)
         const currentLevel = latestAttempt?.test?.level || student.currentLevel || initialLevel;
 
-        // Calculate progress percentage
-        const progressPercentage = latestAttempt?.percentage || 0;
+        // Calculate progress percentage from score
+        // Score is typically out of 100, or calculate from questionCount
+        const score = latestAttempt?.score || 0;
+        const questionCount = latestAttempt?.test?.questionCount || 100;
+        const progressPercentage = questionCount > 0 
+          ? Math.round((score / questionCount) * 100) 
+          : score; // If score is already a percentage, use it directly
 
         return {
           id: student.id,
