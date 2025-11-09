@@ -41,7 +41,6 @@ router.get('/', async (req, res) => {
           orderBy: {
             completedAt: 'desc'
           },
-          take: 1,
           select: {
             score: true,
             completedAt: true,
