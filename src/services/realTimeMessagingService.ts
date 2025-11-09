@@ -37,18 +37,12 @@ export class RealTimeMessagingService {
       allowEIO3: true,
     });
 
-        // Set up Redis adapter for horizontal scaling (if Redis is available)
+        // Set up Redis adapter for horizontal scaling (if Redis is available and connected)
         // Use shared Redis clients from config/redis.ts to avoid duplicate connections
-        if (redisPubClient && redisSubClient) {
-        try {
-          this.io.adapter(createAdapter(redisPubClient, redisSubClient));
-          logger.info('Redis adapter configured for Socket.IO clustering');
-        } catch (error) {
-          logger.warn('Redis adapter setup failed - using default adapter', error);
-          }
-        } else {
-          logger.info('Socket.IO using default adapter (Redis not configured)');
-        }
+        // Fire and forget - will set up adapter when Redis is ready
+        this.setupRedisAdapter().catch((error) => {
+          logger.warn('Redis adapter setup error (non-blocking):', error);
+        });
 
     this.messagingService = new MessagingService(this.io);
     this.messageQueue = messageQueueRedis; // Use shared messageQueueRedis instead of creating new client
@@ -56,7 +50,106 @@ export class RealTimeMessagingService {
     this.initializeSocketHandlers();
     this.initializeCleanupTasks();
     
-    logger.info('Real-time messaging service initialized with Redis clustering');
+    logger.info('Real-time messaging service initialized');
+  }
+
+  /**
+   * Set up Redis adapter for Socket.IO clustering
+   * Only sets up adapter if Redis is configured and clients are ready
+   */
+  private async setupRedisAdapter() {
+    // Check if Redis is configured (same logic as redis.ts)
+    const isRedisEnabled = !!process.env.REDIS_HOST && process.env.REDIS_HOST !== 'localhost';
+    
+    if (!isRedisEnabled) {
+      logger.info('Socket.IO using default adapter (Redis not configured - REDIS_HOST not set)');
+      return;
+    }
+
+    if (!redisPubClient || !redisSubClient) {
+      logger.info('Socket.IO using default adapter (Redis clients not available)');
+      return;
+    }
+
+    // Check if clients are connected
+    const pubStatus = redisPubClient.status;
+    const subStatus = redisSubClient.status;
+    
+    logger.info(`Redis client status - Pub: ${pubStatus}, Sub: ${subStatus}`);
+    
+    // If not connected, wait a bit for connection (max 5 seconds)
+    if (pubStatus !== 'ready' || subStatus !== 'ready') {
+      logger.info('Redis clients not ready, waiting for connection (max 5s)...');
+      
+      try {
+        // Wait for connection with timeout
+        await Promise.race([
+          Promise.all([
+            new Promise<void>((resolve) => {
+              if (pubStatus === 'ready') {
+                resolve();
+                return;
+              }
+              const timeout = setTimeout(() => {
+                redisPubClient.removeListener('ready', onReady);
+                resolve(); // Resolve anyway to not block
+              }, 5000);
+              const onReady = () => {
+                clearTimeout(timeout);
+                resolve();
+              };
+              redisPubClient.once('ready', onReady);
+            }),
+            new Promise<void>((resolve) => {
+              if (subStatus === 'ready') {
+                resolve();
+                return;
+              }
+              const timeout = setTimeout(() => {
+                redisSubClient.removeListener('ready', onReady);
+                resolve(); // Resolve anyway to not block
+              }, 5000);
+              const onReady = () => {
+                clearTimeout(timeout);
+                resolve();
+              };
+              redisSubClient.once('ready', onReady);
+            })
+          ]),
+          new Promise<void>((_, reject) => 
+            setTimeout(() => reject(new Error('Redis connection timeout')), 5000)
+          )
+        ]);
+        
+        // Check status again after waiting
+        const finalPubStatus = redisPubClient.status;
+        const finalSubStatus = redisSubClient.status;
+        
+        if (finalPubStatus !== 'ready' || finalSubStatus !== 'ready') {
+          logger.warn(`Redis clients still not ready after wait - Pub: ${finalPubStatus}, Sub: ${finalSubStatus}. Using default adapter.`);
+          return;
+        }
+      } catch (error: any) {
+        logger.warn('Redis clients not ready after timeout, using default adapter', {
+          error: error?.message || error,
+          pubStatus: redisPubClient.status,
+          subStatus: redisSubClient.status
+        });
+        return;
+      }
+    }
+
+    // Now try to set up the adapter
+    try {
+      this.io.adapter(createAdapter(redisPubClient, redisSubClient));
+      logger.info('✅ Redis adapter configured for Socket.IO clustering');
+    } catch (error: any) {
+      logger.warn('Redis adapter setup failed - using default adapter', {
+        error: error?.message || error,
+        pubStatus: redisPubClient.status,
+        subStatus: redisSubClient.status
+      });
+    }
   }
 
   /**
