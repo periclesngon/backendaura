@@ -4,6 +4,8 @@ services:
     env: node
     region: oregon
     plan: free
+    # CRITICAL: rootDir must be "." for standalone backend repository
+    # This tells Render to use the repository root, not a subdirectory
     rootDir: .
     buildCommand: NODE_OPTIONS=--max-old-space-size=4096 npm install && npm run build
     startCommand: npm start
