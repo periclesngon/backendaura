@@ -1,8 +1,8 @@
 import { Server as SocketIOServer } from 'socket.io';
 import { createAdapter } from '@socket.io/redis-adapter';
-import Redis from 'ioredis';
 import { MessagingService } from './messagingService';
 import { logger } from '../utils/logger';
+import { redisPubClient, redisSubClient, messageQueueRedis } from '../config/redis';
 
 // Extend Socket interface to include custom properties
 declare module 'socket.io' {
@@ -12,40 +12,6 @@ declare module 'socket.io' {
     userName?: string;
   }
 }
-
-// Redis configuration for Socket.IO clustering (optional)
-const createSocketIORedisClients = () => {
-  if (!process.env.REDIS_HOST || process.env.REDIS_HOST === 'localhost') {
-    return { pubClient: null, subClient: null };
-  }
-  
-  try {
-const pubClient = new Redis({
-      host: process.env.REDIS_HOST,
-  port: parseInt(process.env.REDIS_PORT || '6379'),
-  password: process.env.REDIS_PASSWORD,
-      lazyConnect: false, // Connect immediately
-      maxRetriesPerRequest: 3,
-      retryStrategy: (times) => times > 5 ? null : Math.min(times * 200, 2000),
-    });
-    
-    pubClient.on('error', (err) => {
-      logger.warn('Socket.IO Redis pub client error:', err.message);
-});
-
-const subClient = pubClient.duplicate();
-    subClient.on('error', (err) => {
-      logger.warn('Socket.IO Redis sub client error:', err.message);
-    });
-    
-    return { pubClient, subClient };
-  } catch (error) {
-    logger.warn('Failed to create Socket.IO Redis clients:', error);
-    return { pubClient: null, subClient: null };
-  }
-};
-
-const { pubClient, subClient } = createSocketIORedisClients();
 
 export class RealTimeMessagingService {
   private io: SocketIOServer;
@@ -71,9 +37,10 @@ export class RealTimeMessagingService {
     });
 
         // Set up Redis adapter for horizontal scaling (if Redis is available)
-        if (pubClient && subClient) {
+        // Use shared Redis clients from config/redis.ts to avoid duplicate connections
+        if (redisPubClient && redisSubClient) {
         try {
-          this.io.adapter(createAdapter(pubClient, subClient));
+          this.io.adapter(createAdapter(redisPubClient, redisSubClient));
           logger.info('Redis adapter configured for Socket.IO clustering');
         } catch (error) {
           logger.warn('Redis adapter setup failed - using default adapter', error);
@@ -83,7 +50,7 @@ export class RealTimeMessagingService {
         }
 
     this.messagingService = new MessagingService(this.io);
-    this.messageQueue = pubClient;
+    this.messageQueue = messageQueueRedis; // Use shared messageQueueRedis instead of creating new client
 
     this.initializeSocketHandlers();
     this.initializeCleanupTasks();

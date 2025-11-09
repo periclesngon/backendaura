@@ -1,6 +1,7 @@
 import { MessagingService } from '../services/messagingService';
 import { logger } from '../utils/logger';
-import Redis from 'ioredis';
+import { messageQueueRedis } from '../config/redis';
+import type Redis from 'ioredis';
 
 export class MessageQueueWorker {
   private messagingService: MessagingService;
@@ -11,29 +12,8 @@ export class MessageQueueWorker {
   constructor() {
     this.workerId = `worker-${process.pid}-${Date.now()}`;
     
-    // Only create Redis client if Redis is configured
-    if (process.env.REDIS_HOST && process.env.REDIS_HOST !== 'localhost') {
-      try {
-    this.redis = new Redis({
-          host: process.env.REDIS_HOST,
-      port: parseInt(process.env.REDIS_PORT || '6379'),
-      password: process.env.REDIS_PASSWORD,
-          lazyConnect: false, // Connect immediately
-          maxRetriesPerRequest: 3,
-          retryStrategy: (times) => times > 5 ? null : Math.min(times * 200, 2000),
-        });
-        
-        this.redis.on('error', (err) => {
-          logger.warn('Message queue worker Redis error:', err.message);
-        });
-      } catch (error) {
-        logger.warn('Failed to create Redis client for message queue worker:', error);
-        this.redis = null;
-      }
-    } else {
-      logger.warn('Message queue worker initialized without Redis - worker will not process messages');
-      this.redis = null;
-    }
+    // Use shared messageQueueRedis from config/redis.ts to avoid duplicate connections
+    this.redis = messageQueueRedis;
 
     this.messagingService = new MessagingService(null as any);
     

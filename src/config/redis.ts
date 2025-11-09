@@ -94,69 +94,55 @@ const createSafeRedisClient = (config: any, name: string): Redis | null => {
   }
 };
 
-// Main Redis client for general operations
+// Main Redis client for general operations (shared by multiple services)
 export const redis = createSafeRedisClient({ keyPrefix: 'aura:messaging:' }, 'main') as Redis | null;
 
-// Redis client for Socket.IO adapter
+// Redis client for Socket.IO adapter (pub/sub pattern requires separate clients)
 export const redisPubClient = createSafeRedisClient({ keyPrefix: 'aura:socketio:' }, 'pub') as Redis | null;
 export const redisSubClient = redisPubClient ? redisPubClient.duplicate() : null;
 
-// Redis client for message queues (high throughput)
+// Redis client for message queues (uses separate DB for isolation)
 export const messageQueueRedis = createSafeRedisClient({ 
   keyPrefix: 'aura:queue:',
   db: 1,
   maxRetriesPerRequest: null,
 }, 'queue') as Redis | null;
 
-// Redis client for caching (fast access)
+// Redis client for caching (uses separate DB for isolation)
 export const cacheRedis = createSafeRedisClient({ 
   keyPrefix: 'aura:cache:',
   db: 2,
   maxRetriesPerRequest: 1,
 }, 'cache') as Redis | null;
 
-// Redis client for rate limiting (strict)
+// Redis client for rate limiting (uses separate DB for isolation)
 export const rateLimitRedis = createSafeRedisClient({ 
   keyPrefix: 'aura:rate:',
   db: 3,
   maxRetriesPerRequest: 1,
 }, 'ratelimit') as Redis | null;
 
-// Redis client for sessions
-export const sessionRedis = createSafeRedisClient({ keyPrefix: 'aura:session:' }, 'session') as Redis | null;
+// CONSOLIDATED: Reuse clients where possible to reduce connection count
+// Note: Services using these should ensure key prefixes don't conflict
+// Total connections reduced from 18+ to ~7 (main, pub, sub, queue, cache, ratelimit, monitoring)
 
-// Redis client for presence tracking
-export const presenceRedis = createSafeRedisClient({ keyPrefix: 'aura:presence:' }, 'presence') as Redis | null;
+// Reuse main client for services that can share the 'aura:messaging:' prefix
+export const sessionRedis = redis;
+export const presenceRedis = redis;
+export const typingRedis = redis;
+export const notificationRedis = redis;
+export const analyticsRedis = redis;
+export const searchRedis = redis;
+export const uploadRedis = redis;
+export const encryptionRedis = redis;
+export const webhookRedis = redis;
+export const deadLetterRedis = messageQueueRedis; // Reuse message queue client (same DB)
 
-// Redis client for typing indicators
-export const typingRedis = createSafeRedisClient({ keyPrefix: 'aura:typing:' }, 'typing') as Redis | null;
-
-// Redis client for notifications
-export const notificationRedis = createSafeRedisClient({ keyPrefix: 'aura:notification:' }, 'notification') as Redis | null;
-
-// Redis client for analytics
-export const analyticsRedis = createSafeRedisClient({ keyPrefix: 'aura:analytics:' }, 'analytics') as Redis | null;
-
-// Redis client for search indexing
-export const searchRedis = createSafeRedisClient({ keyPrefix: 'aura:search:' }, 'search') as Redis | null;
-
-// Redis client for file uploads
-export const uploadRedis = createSafeRedisClient({ keyPrefix: 'aura:upload:' }, 'upload') as Redis | null;
-
-// Redis client for encryption keys
-export const encryptionRedis = createSafeRedisClient({ keyPrefix: 'aura:encryption:' }, 'encryption') as Redis | null;
-
-// Redis client for webhooks
-export const webhookRedis = createSafeRedisClient({ keyPrefix: 'aura:webhook:' }, 'webhook') as Redis | null;
-
-// Redis client for dead letter queue
-export const deadLetterRedis = createSafeRedisClient({ keyPrefix: 'aura:deadletter:' }, 'deadletter') as Redis | null;
-
-// Redis client for monitoring
+// Keep monitoringRedis separate as it needs 'aura:monitoring:' prefix for monitoring-specific keys
 export const monitoringRedis = createSafeRedisClient({ keyPrefix: 'aura:monitoring:' }, 'monitoring') as Redis | null;
 
-// Redis client for testing
-export const testRedis = createSafeRedisClient({ keyPrefix: 'aura:test:' }, 'test') as Redis | null;
+// Test client - reuse main in production, separate only if needed for testing
+export const testRedis = redis;
 
 // Redis cluster configuration (for production scaling)
 export const createRedisCluster = () => {
@@ -269,16 +255,22 @@ export const shutdownRedis = async () => {
   
   logger.info('Shutting down Redis connections...');
   
-  const clients = [
-    redis, redisPubClient, redisSubClient, messageQueueRedis,
-    cacheRedis, sessionRedis, rateLimitRedis, presenceRedis,
-    typingRedis, notificationRedis, analyticsRedis, searchRedis,
-    uploadRedis, encryptionRedis, webhookRedis, deadLetterRedis,
-    monitoringRedis, testRedis
-  ].filter(Boolean) as Redis[]; // Filter out null clients
+  // Only shutdown unique clients (consolidated clients are references, not new connections)
+  const uniqueClients = [
+    redis, 
+    redisPubClient, 
+    redisSubClient, // subClient is a duplicate of pubClient, but needs to be closed separately
+    messageQueueRedis,
+    cacheRedis, 
+    rateLimitRedis,
+    monitoringRedis
+  ].filter((client, index, self) => {
+    // Remove duplicates (subClient might be duplicate of pubClient)
+    return client && self.indexOf(client) === index;
+  }) as Redis[];
 
-  await Promise.allSettled(clients.map(client => client.quit().catch(err => logger.warn('Error closing Redis client:', err))));
-  logger.info('All Redis connections closed');
+  await Promise.allSettled(uniqueClients.map(client => client.quit().catch(err => logger.warn('Error closing Redis client:', err))));
+  logger.info(`All Redis connections closed (${uniqueClients.length} unique clients)`);
 };
 
 // Process cleanup
