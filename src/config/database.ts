@@ -53,6 +53,33 @@ if (process.env.NODE_ENV === 'development') {
   process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
 }
 
+// Enhanced connection retry logic for Neon database
+const connectWithRetry = async (maxRetries = 3, delay = 2000) => {
+  for (let i = 0; i < maxRetries; i++) {
+    try {
+      await prisma.$connect();
+      console.log('✅ Database connected successfully');
+      return true;
+    } catch (error: any) {
+      console.error(`❌ Database connection attempt ${i + 1}/${maxRetries} failed:`, error.message);
+      if (i < maxRetries - 1) {
+        console.log(`⏳ Retrying in ${delay}ms...`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+        delay *= 1.5; // Exponential backoff
+      } else {
+        console.error('❌ All database connection attempts failed');
+        throw error;
+      }
+    }
+  }
+  return false;
+};
+
+// Initialize connection on startup
+connectWithRetry().catch(err => {
+  console.error('❌ Failed to connect to database:', err);
+});
+
 // Connection pool monitoring and error handling
 let connectionPoolHealthy = true;
 
