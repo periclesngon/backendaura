@@ -299,16 +299,28 @@ router.post('/test-complete-flow', async (req, res) => {
 // Get available voice options
 router.get('/voices', async (req, res) => {
   try {
+    // Ensure vapiService is initialized
+    if (!vapiService) {
+      throw new Error('VAPI service not initialized');
+    }
+    
     const voices = vapiService.getVoiceOptions();
+    
+    if (!voices || !Array.isArray(voices)) {
+      throw new Error('Invalid voice options returned');
+    }
+    
     res.json({
       success: true,
       data: voices,
       message: 'Available voices retrieved successfully'
     });
   } catch (error: any) {
+    console.error('Error fetching voices:', error);
     res.status(500).json({
       success: false,
-      message: error.message
+      message: error.message || 'Failed to fetch available voices',
+      error: error.message
     });
   }
 });
@@ -1755,101 +1767,6 @@ router.post('/end/:simulationId', temporaryOrRegularAuth('voice'), async (req, r
     res.status(400).json({
       success: false,
       message: error.message
-    });
-  }
-});
-
-// Get all sujets from question bank (where AI extracted content is stored)
-router.get('/question-bank/sujets', async (req, res) => {
-  try {
-    // Get all question banks where AI extracted content is stored
-    const questionBanks = await prisma.questionBank.findMany({
-      where: {
-        isActive: true,
-        OR: [
-          { category: 'GENERAL' }, // Voice simulation questions
-          { category: 'IMMIGRATION' } // Immigration simulation questions (shared access)
-        ]
-      },
-      select: {
-        id: true,
-        title: true,
-        extractedQuestions: true,
-        level: true,
-        category: true,
-        createdAt: true
-      },
-      orderBy: {
-        createdAt: 'desc'
-      }
-    });
-
-    console.log(`📚 Found ${questionBanks.length} question banks for voice simulation (shared with immigration)`);
-
-    // Extract sujets from extractedQuestions field
-    const allSujets = new Set<string>();
-    
-    questionBanks.forEach(bank => {
-      if (bank.extractedQuestions && Array.isArray(bank.extractedQuestions)) {
-        // Extract question text as sujets
-        (bank.extractedQuestions as any[]).forEach((q: any) => {
-          if (q.question) {
-            allSujets.add(q.question);
-          }
-        });
-      } else if (bank.extractedQuestions && typeof bank.extractedQuestions === 'object') {
-        // Handle case where extractedQuestions is an object with questions array
-        const data = bank.extractedQuestions as any;
-        if (data.questions && Array.isArray(data.questions)) {
-          data.questions.forEach((q: any) => {
-            if (q.question) {
-              allSujets.add(q.question);
-            }
-          });
-        }
-      }
-    });
-
-    const sujets = Array.from(allSujets);
-
-    console.log(`📝 Found ${sujets.length} sujets from question banks`);
-
-    // If no sujets found, return default ones
-    if (sujets.length === 0) {
-      const defaultSujets = [
-        'Immigration et intégration',
-        'Vie quotidienne et culture',
-        'Travail et carrière',
-        'Éducation et formation',
-        'Santé et bien-être',
-        'Voyages et tourisme',
-        'Technologie et innovation',
-        'Environnement et développement durable'
-      ];
-      return res.json({
-        success: true,
-        data: {
-          sujets: defaultSujets,
-          source: 'default',
-          message: 'Aucun contenu extrait trouvé - Utilisation des sujets par défaut'
-        }
-      });
-    }
-
-    res.json({
-      success: true,
-      data: {
-        sujets: sujets.sort(),
-        source: 'question_banks',
-        count: sujets.length,
-        message: `${sujets.length} sujets trouvés dans la banque de questions`
-      }
-    });
-  } catch (error: any) {
-    console.error('Error fetching sujets:', error);
-    res.status(500).json({
-      success: false,
-      message: error.message || 'Failed to fetch sujets'
     });
   }
 });
