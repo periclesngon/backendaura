@@ -58,6 +58,7 @@ model User {
   dailyGoals                   UserDailyGoal[]          @relation("UserDailyGoals")
   marketplaceRequestsAsStudent MarketplaceRequest[]     @relation("StudentRequests")
   marketplaceRequestsAsTutor   MarketplaceRequest[]     @relation("TutorRequests")
+  sessionReminders             SessionReminder[]
 
   @@index([createdAt])
   @@index([status, role, subscriptionTier, createdAt])
@@ -370,6 +371,7 @@ model LiveSession {
   isOneOnOne       Boolean                  @default(false)
   secureToken      String?                  @unique
   participants     LiveSessionParticipant[]
+  reminders        SessionReminder[]
   createdBy        User                     @relation("LiveSessionCreator", fields: [createdById], references: [id])
   invitedStudent   User?                    @relation("InvitedToLiveSession", fields: [invitedStudentId], references: [id], onDelete: SetNull)
 
@@ -389,6 +391,26 @@ model LiveSessionParticipant {
 
   @@unique([userId, liveSessionId])
   @@map("live_session_participants")
+}
+
+model SessionReminder {
+  id            String    @id @default(cuid())
+  userId        String
+  sessionId     String
+  reminderTime  Int       // Minutes before session (5 or 10)
+  reminderDate  DateTime  // When to send the reminder
+  reminderType  String    @default("scheduled") // 'scheduled' or 'status_change'
+  emailSent     Boolean   @default(false)
+  sentAt        DateTime?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+  session       LiveSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  user          User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, sessionId])
+  @@index([reminderDate, emailSent])
+  @@index([sessionId, reminderType])
+  @@map("session_reminders")
 }
 
 model Notification {
@@ -1131,6 +1153,7 @@ enum VoiceSimulationStatus {
   ACTIVE
   COMPLETED
   CANCELLED
+  EXPIRED
 }
 
 enum BookingType {

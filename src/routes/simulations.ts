@@ -982,6 +982,7 @@ router.get('/free-attempts/count', authenticate, async (req: Request, res: Respo
     const limitInfo = await checkSimulationLimit(userId);
 
     // Get detailed breakdown for response
+    // IMPORTANT: Only count valid simulations (completed with AI feedback for voice simulations)
     const [testAttempts, voiceSimulations, immigrationSimulations] = await Promise.all([
       prisma.testAttempt.count({
       where: {
@@ -989,16 +990,23 @@ router.get('/free-attempts/count', authenticate, async (req: Request, res: Respo
           createdAt: { gte: limitInfo.periodStartDate }
       }
       }),
+      // Only count completed voice simulations with AI feedback (valid sessions)
       prisma.voiceSimulation.count({
         where: {
           userId,
-          createdAt: { gte: limitInfo.periodStartDate }
+          createdAt: { gte: limitInfo.periodStartDate },
+          status: 'COMPLETED', // Only count completed simulations
+          aiFeedbacks: {
+            some: {} // Must have at least one AIFeedback to be valid
+          }
         }
       }),
+      // Only count COMPLETED immigration simulations (valid simulations)
       prisma.immigrationSimulation.count({
         where: {
           userId,
-          createdAt: { gte: limitInfo.periodStartDate }
+          createdAt: { gte: limitInfo.periodStartDate },
+          status: 'COMPLETED'
         }
       })
     ]);
@@ -1031,11 +1039,20 @@ router.get('/free-attempts/count', authenticate, async (req: Request, res: Respo
         }
       }
     });
-  } catch (error) {
-    console.error('Error getting simulation attempts count:', error);
+  } catch (error: any) {
+    console.error('❌ Error getting simulation attempts count:', error);
+    console.error('Error details:', {
+      message: error?.message,
+      stack: error?.stack,
+      code: error?.code,
+      meta: error?.meta
+    });
     res.status(500).json({
       success: false,
-      error: { message: 'Failed to get simulation attempts count' }
+      error: { 
+        message: error?.message || 'Failed to get simulation attempts count',
+        details: error?.meta || error?.code
+      }
     });
   }
 });

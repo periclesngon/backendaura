@@ -84,12 +84,10 @@ export class TestService {
       // Create test with questions in a transaction
       // Increase transaction timeout to 30 seconds for large test creation
       const result = await prisma.$transaction(async (tx) => {
-        // Extract fileUrl from testData if present (for reading comprehension)
+        // Extract fileUrl from testData if present (for reading comprehension - entire PDF)
         const testDataWithFileUrl = testData as any;
         const fileUrl = testDataWithFileUrl.fileUrl;
-        const tags = fileUrl 
-          ? [...testData.tags, `fileUrl:${fileUrl}`] // Store fileUrl in tags temporarily
-          : testData.tags;
+        const tags = testData.tags || [];
         
         // Create test
         const test = await tx.test.create({
@@ -105,6 +103,7 @@ export class TestService {
             difficulty: testData.difficulty,
             passingScore: testData.passingScore,
             tags: tags,
+            ...(fileUrl ? { fileUrl } : {}), // PDF URL for entire document (Compréhension Écrite)
             aiPowered: testData.aiPowered || false,
             hasAIFeedback: testData.hasAIFeedback || false,
             isOfficial: testData.isOfficial || false,
@@ -170,6 +169,11 @@ export class TestService {
               correctAnswer: correctAnswerJson, // JSON field - required
               points: question.points || 1,
               explanation: question.explanation || null,
+              passage: question.passage || null, // Reading passage or context (separate from question text) - can be long (500-2000+ words)
+              fileUrl: question.fileUrl || null, // PDF URL for question-level documents
+              minWords: question.minWords || null, // Minimum word count for Expression Écrite
+              maxWords: question.maxWords || null, // Maximum word count for Expression Écrite
+              writingType: question.writingType || null, // Writing type: "article", "essay", "letter"
               order: question.order || index + 1,
               level: level, // CourseLevel enum
               category: category // CourseCategory enum
@@ -241,6 +245,11 @@ export class TestService {
                   correctAnswer: question.correctAnswer,
                   points: question.points,
                   explanation: question.explanation,
+                  passage: question.passage || null,
+                  fileUrl: question.fileUrl || null,
+                  minWords: question.minWords || null,
+                  maxWords: question.maxWords || null,
+                  writingType: question.writingType || null,
                   order: question.order,
                   level: variant.level,
                   category: variant.category
@@ -388,7 +397,12 @@ export class TestService {
           allowRewind: true,
           timeLimit: undefined,
           points: q.points,
-          explanation: q.explanation
+          explanation: q.explanation,
+          passage: q.passage || null,
+          fileUrl: q.fileUrl || null,
+          minWords: q.minWords || null,
+          maxWords: q.maxWords || null,
+          writingType: q.writingType || null
         };
 
         // Extract options - handle both array format and object format
@@ -431,19 +445,12 @@ export class TestService {
         return question;
       });
 
-      // Extract fileUrl from test tags (temporary solution - stored as "fileUrl:URL")
-      // In production, this should be stored in a metadata field
-      let fileUrl: string | undefined = undefined;
-      const fileUrlTag = test.tags.find(tag => tag.startsWith('fileUrl:'));
-      if (fileUrlTag) {
-        fileUrl = fileUrlTag.replace('fileUrl:', '');
-      }
-
       // Add computed fields
-      const testWithDetails: TestWithDetails & { fileUrl?: string } = {
+      const testWithDetails: TestWithDetails & { fileUrl?: string; category?: string } = {
         ...test,
         questions: transformedQuestions as any,
-        fileUrl: fileUrl,
+        fileUrl: (test as any).fileUrl || undefined, // Get fileUrl directly from test model
+        category: test.category, // Include test category
         isFavorited: false, // Will be calculated separately if needed
         bestScore,
         attemptsCount

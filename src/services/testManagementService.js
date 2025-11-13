@@ -496,67 +496,53 @@ class TestManagementService {
   }
 
   /**
-   * Helper methods
+   * Helper methods - Updated to use new AIEvaluationService
    */
   static async evaluateAnswer(question, userAnswer) {
-    if (question.type === 'text_input' || question.type === 'expression_ecrite') {
-      // Use Gemini AI for text evaluation
-      try {
-        const response = await geminiApiManager.makeRequest(async (model) => {
-          const prompt = `
-          Évalue cette réponse à une question de test de français:
+    // Import the new evaluation service
+    const { AIEvaluationService } = require('./aiEvaluationService');
+    
+    try {
+      const evaluationRequest = {
+        question: {
+          id: question.id || '',
+          type: question.type,
+          questionText: question.question || question.questionText || '',
+          passage: question.passage || null,
+          correctAnswer: question.correctAnswer,
+          category: question.category || 'GENERAL',
+          level: question.level || 'B1',
+          points: question.points || 1,
+          options: question.options || [],
+          minWords: question.minWords || null,
+          maxWords: question.maxWords || null,
+          writingType: question.writingType || null
+        },
+        userAnswer: userAnswer
+      };
 
-          QUESTION: "${question.question}"
-          RÉPONSE DE L'UTILISATEUR: "${userAnswer}"
-          NIVEAU: ${question.level}
-          POINTS MAXIMUM: ${question.points}
-
-          Critères d'évaluation:
-          1. Pertinence (répond à la question)
-          2. Correction grammaticale
-          3. Richesse du vocabulaire
-          4. Cohérence et structure
-
-          Format JSON:
-          {
-            "isCorrect": true,
-            "score": 8,
-            "maxScore": ${question.points},
-            "feedback": "Très bonne réponse. Grammaire correcte et vocabulaire approprié."
-          }
-
-          Réponds UNIQUEMENT avec le JSON valide.
-          `;
-
-          const result = await model.generateContent(prompt);
-          const response = await result.response;
-          const text = response.text();
-
-          const jsonMatch = text.match(/\{[\s\S]*\}/);
-          if (jsonMatch) {
-            return JSON.parse(jsonMatch[0]);
-          }
-          throw new Error('No JSON found');
-        });
-
-        return response;
-      } catch (error) {
-        logger.warn('Failed to evaluate text answer with AI', { error });
+      const evaluation = await AIEvaluationService.evaluateAnswer(evaluationRequest);
+      return evaluation;
+    } catch (error) {
+      logger.warn('Failed to evaluate answer with AIEvaluationService', { error, questionId: question.id });
+      
+      // Fallback to simple evaluation
+      if (question.type === 'multiple-choice' || question.type === 'true-false') {
+        const isCorrect = String(userAnswer) === String(question.correctAnswer);
         return {
-          isCorrect: true,
-          score: Math.round(question.points * 0.7),
+          isCorrect,
+          score: isCorrect ? question.points : 0,
           maxScore: question.points,
-          feedback: 'Réponse évaluée automatiquement.'
+          feedback: isCorrect ? 'Correct!' : 'Incorrect.'
         };
       }
-    } else {
-      // Simple evaluation for multiple choice
-      const isCorrect = userAnswer === question.correctAnswer;
+      
+      // Fallback for text answers
       return {
-        isCorrect,
-        score: isCorrect ? question.points : 0,
-        maxScore: question.points,
-        feedback: isCorrect ? 'Correct!' : 'Incorrect.'
+        isCorrect: false,
+        score: 0,
+        maxScore: question.points || 1,
+        feedback: 'Erreur lors de l\'évaluation. Veuillez réessayer.'
       };
     }
   }

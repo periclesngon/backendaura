@@ -112,28 +112,37 @@ export async function checkSimulationLimit(userId: string): Promise<{
   }
 
   // Count ALL simulation types used within the current billing period (30-day cycle)
-  const [testAttempts, voiceSimulations, immigrationSimulations] = await Promise.all([
+  // IMPORTANT: For voice simulations, only count sessions that have AIFeedback (valid sessions)
+  const [testAttempts, voiceSimulationsWithFeedback, immigrationSimulations] = await Promise.all([
     prisma.testAttempt.count({
       where: {
         userId,
         createdAt: { gte: periodStartDate }
       }
     }),
+    // Only count voice simulations that have AIFeedback (valid sessions)
+    // Only count COMPLETED sessions with AI feedback - these are the only valid ones
     prisma.voiceSimulation.count({
       where: {
         userId,
-        createdAt: { gte: periodStartDate }
+        createdAt: { gte: periodStartDate },
+        status: 'COMPLETED', // Only count completed simulations
+        aiFeedbacks: {
+          some: {} // Must have at least one AIFeedback
+        }
       }
     }),
+    // Only count COMPLETED immigration simulations (valid simulations)
     prisma.immigrationSimulation.count({
       where: {
         userId,
-        createdAt: { gte: periodStartDate }
+        createdAt: { gte: periodStartDate },
+        status: 'COMPLETED'
       }
     })
   ]);
 
-  const totalSimulationsUsed = testAttempts + voiceSimulations + immigrationSimulations;
+  const totalSimulationsUsed = testAttempts + voiceSimulationsWithFeedback + immigrationSimulations;
   const remaining = maxSimulations === Infinity ? Infinity : Math.max(0, maxSimulations - totalSimulationsUsed);
   const canCreate = maxSimulations === Infinity ? true : totalSimulationsUsed < maxSimulations;
 

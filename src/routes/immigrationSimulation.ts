@@ -3,6 +3,7 @@ import { PrismaClient } from '@prisma/client';
 import { authenticate, requireRole } from '../middleware/auth';
 import { validate, immigrationSimulationSchemas } from '../middleware/validation';
 import { requestLogger, errorLogger } from '../middleware/requestLogger';
+import { temporaryOrRegularAuth } from '../middleware/temporaryAuth';
 import I18nService, { Language } from '../services/i18nService';
 
 const router = express.Router();
@@ -14,20 +15,20 @@ const ImmigrationSimulationService = require('../services/immigrationSimulationS
 // STUDENT ROUTES
 
 /**
- * @route GET /api/immigration-simulation/history/user
- * @desc Get user's immigration simulation history
+ * @route GET /api/immigration-simulation/history
+ * @desc Get user's immigration simulation history (with dynamic status correction)
  * @access Private (Student)
  */
-router.get('/history/user', authenticate, async (req, res) => {
+router.get('/history', authenticate, async (req, res) => {
   try {
     // Check both id and userId for compatibility - prioritize userId from JWT
-    const userId = req.user?.userId || req.user?.id;
+    const userId = (req as any).user?.userId || req.user.id;
     
     if (!userId) {
       console.error('❌ No userId found in token (immigration history):', {
         user: req.user,
         hasId: !!req.user?.id,
-        hasUserId: !!req.user?.userId
+        hasUserId: !!(req as any).user?.userId
       });
       return res.status(401).json({
         success: false,
@@ -58,13 +59,13 @@ router.get('/history/user', authenticate, async (req, res) => {
 });
 
 /**
- * @route GET /api/immigration-simulation/monthly-count/user
- * @desc Get user's monthly immigration simulation count
+ * @route GET /api/immigration-simulation/monthly-count
+ * @desc Get user's monthly immigration simulation count (only valid simulations with AI feedback)
  * @access Private (Student)
  */
-router.get('/monthly-count/user', authenticate, async (req, res) => {
+router.get('/monthly-count', authenticate, async (req, res) => {
   try {
-    const userId = req.user.id;
+    const userId = (req as any).user?.userId || req.user.id;
 
     // Check if user has Pro subscription (immigration is Pro-only)
     const user = await prisma.user.findUnique({
@@ -198,33 +199,29 @@ router.post('/create',
 /**
  * @route POST /api/immigration-simulation/start/:id
  * @desc Start an immigration simulation
- * @access Private (Student)
+ * @access Private (Student) or Temporary Token (from email link)
  */
 router.post('/start/:id',
   requestLogger,
-  authenticate,
+  temporaryOrRegularAuth('immigration'),
   validate({ params: immigrationSimulationSchemas.params }),
   async (req, res) => {
   try {
     const { id } = req.params;
-    const userId = req.user.id;
+    // Get userId from either regular auth or temporary auth
+    const userId = (req as any).user?.userId || (req as any).user?.id || (req as any).temporaryAuth?.userId;
     const language = I18nService.getLanguageFromRequest(req);
 
-    // Verify the simulation belongs to the user
-    const simulation = await prisma.immigrationSimulation.findFirst({
-      where: { id, userId }
-    });
-
-    if (!simulation) {
-      return res.status(404).json({
+    if (!userId) {
+      return res.status(401).json({
         success: false,
         message: language === 'fr'
-          ? 'Simulation non trouvée'
-          : 'Simulation not found'
+          ? 'Authentification requise'
+          : 'Authentication required'
       });
     }
 
-    // Start the simulation using the service
+    // Start the simulation using the service (with race condition protection)
     const result = await ImmigrationSimulationService.startSession(id, userId);
 
     res.json({
@@ -544,6 +541,164 @@ router.get('/:id', authenticate, async (req, res) => {
     res.status(404).json({
       success: false,
       message: error.message
+    });
+  }
+});
+
+/**
+ * @route POST /api/immigration-simulation/book
+ * @desc Book a new immigration simulation (AUTO or MANUAL)
+ * @access Private (Student)
+ */
+router.post('/book', authenticate, async (req, res) => {
+  try {
+    const userId = (req as any).user?.userId || req.user.id;
+    const { bookingType, preferredDates, country, immigrationType, level, personalInfo, voicePreference } = req.body;
+    const language = I18nService.getLanguageFromRequest(req);
+
+    // Create booking using the service
+    const sessionData = {
+      country: country || 'canada',
+      immigrationType: immigrationType || 'skilled_worker',
+      level: level || 'B1',
+      personalInfo: personalInfo || {},
+      voicePreference: voicePreference || 'france_female_1',
+      bookingType: bookingType || 'AUTO',
+      scheduledDate: preferredDates && preferredDates.length > 0 ? new Date(preferredDates[0]) : null,
+      questionsData: {}
+    };
+
+    const simulation = await ImmigrationSimulationService.createImmigrationSession(userId, sessionData);
+
+    res.json({
+      success: true,
+      data: simulation,
+      message: language === 'fr'
+        ? 'Simulation d\'immigration créée avec succès'
+        : 'Immigration simulation created successfully'
+    });
+  } catch (error: any) {
+    const language = I18nService.getLanguageFromRequest(req);
+    console.error('Error booking immigration simulation:', error);
+    res.status(400).json({
+      success: false,
+      message: error.message || (language === 'fr'
+        ? 'Erreur lors de la réservation'
+        : 'Error booking simulation')
+    });
+  }
+});
+
+/**
+ * @route GET /api/immigration-simulation/:id
+ * @desc Get a single immigration simulation by ID
+ * @access Private (Student) or Temporary Token
+ */
+router.get('/:id', temporaryOrRegularAuth('immigration'), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const userId = (req as any).user?.userId || (req as any).user?.id || (req as any).temporaryAuth?.userId;
+    const language = I18nService.getLanguageFromRequest(req);
+
+    if (!userId) {
+      return res.status(401).json({
+        success: false,
+        message: 'Authentication required'
+      });
+    }
+
+    const simulation = await prisma.immigrationSimulation.findFirst({
+      where: { id, userId }
+    });
+
+    if (!simulation) {
+      return res.status(404).json({
+        success: false,
+        message: language === 'fr'
+          ? 'Simulation non trouvée'
+          : 'Simulation not found'
+      });
+    }
+
+    // Dynamic status correction
+    let displayStatus = simulation.status as string;
+    const scheduledDate = (simulation as any).scheduledDate;
+    if (scheduledDate) {
+      const now = new Date();
+      const scheduledDateObj = new Date(scheduledDate);
+      if (simulation.status === 'SCHEDULED' && scheduledDateObj < now) {
+        displayStatus = 'EXPIRED';
+      } else if (simulation.status === 'EXPIRED' && scheduledDateObj >= now) {
+        displayStatus = 'SCHEDULED';
+      }
+    }
+
+    res.json({
+      success: true,
+      data: {
+        ...simulation,
+        status: displayStatus
+      }
+    });
+  } catch (error: any) {
+    console.error('Error getting immigration simulation:', error);
+    res.status(500).json({
+      success: false,
+      message: error.message || 'Failed to fetch simulation'
+    });
+  }
+});
+
+/**
+ * @route DELETE /api/immigration-simulation/delete/:id
+ * @desc Delete a cancelled immigration simulation
+ * @access Private (Student)
+ */
+router.delete('/delete/:id', authenticate, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const userId = (req as any).user?.userId || req.user.id;
+    const language = I18nService.getLanguageFromRequest(req);
+
+    const result = await ImmigrationSimulationService.deleteImmigrationSimulation(id, userId, language);
+
+    res.json({
+      success: true,
+      data: result,
+      message: language === 'fr'
+        ? 'Simulation supprimée avec succès'
+        : 'Simulation deleted successfully'
+    });
+  } catch (error: any) {
+    const language = I18nService.getLanguageFromRequest(req);
+    res.status(400).json({
+      success: false,
+      message: error.message || (language === 'fr'
+        ? 'Erreur lors de la suppression'
+        : 'Error deleting simulation')
+    });
+  }
+});
+
+/**
+ * @route POST /api/immigration-simulation/admin/mark-expired
+ * @desc Mark all expired immigration sessions (Admin only)
+ * @access Private (Senior Manager or Admin)
+ */
+router.post('/admin/mark-expired', requireRole(['ADMIN', 'SENIOR_MANAGER']), async (req, res) => {
+  try {
+    const result = await ImmigrationSimulationService.markExpiredImmigrationSessions();
+
+    res.json({
+      success: true,
+      data: result,
+      message: `Marked ${result.scheduled + result.active} expired immigration sessions`
+    });
+  } catch (error: any) {
+    console.error('Error marking expired immigration sessions:', error);
+    res.status(500).json({
+      success: false,
+      message: error.message || 'Failed to mark expired sessions'
     });
   }
 });

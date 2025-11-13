@@ -1,5 +1,7 @@
 import { logger } from '../utils/logger'
-const geminiApiManager = require('../utils/geminiApiManager')
+// Use Mistral AI as primary, Gemini as fallback
+const mistralApiManager = require('../utils/mistralApiManager')
+const geminiApiManager = require('../utils/geminiApiManager') // Keep as fallback
 
 export class AIService {
   // Generate personalized greeting message
@@ -170,30 +172,65 @@ export class AIService {
     try {
       const { message, systemPrompt, context } = params
       
-      // Use Gemini API Manager for AI response
-      const response = await geminiApiManager.makeRequest(async (model) => {
-        const prompt = `${systemPrompt}
-
-Message: ${message}
-
-Réponds directement et utilement en français.`
-
-        const result = await model.generateContent(prompt)
-        const response = await result.response
-        return response.text()
-      })
-
+      // Use Mistral AI for AI response - IMPROVED for better quality
+      let text = '';
+      try {
+        text = await mistralApiManager.generateContent(message, {
+          systemPrompt: systemPrompt,
+          maxTokens: 300, // Increased for better responses
+          temperature: 0.8, // Slightly higher for more natural variation
+          model: 'mistral-small-latest' // Free tier friendly model
+        });
+        
+        // Remove asterisks used for bold formatting
+        text = text.replace(/\*\*([^*]+)\*\*/g, '$1') // Remove **bold**
+        text = text.replace(/\*([^*]+)\*/g, '$1') // Remove *italic*
+        text = text.replace(/\*\*\*/g, '') // Remove triple asterisks
+        text = text.replace(/\*\*/g, '') // Remove double asterisks
+        text = text.replace(/\*/g, '') // Remove single asterisks
+      } catch (mistralError: any) {
+        logger.warn('Mistral AI failed, falling back to Gemini:', mistralError?.message);
+        // Fallback to Gemini if Mistral fails
+        const response = await geminiApiManager.makeRequest(async (model) => {
+          const prompt = `${systemPrompt}\n\nMessage: ${message}\n\nRéponds CONCISEMENT en français. Pas d'astérisques.`
+          const result = await model.generateContent(prompt)
+          const response = await result.response
+          let text = response.text()
+          text = text.replace(/\*\*([^*]+)\*\*/g, '$1')
+          text = text.replace(/\*([^*]+)\*/g, '$1')
+          text = text.replace(/\*\*\*/g, '')
+          text = text.replace(/\*\*/g, '')
+          text = text.replace(/\*/g, '')
+          return text
+        });
+        text = response;
+      }
+      
       return {
-        content: response,
+        content: text,
         confidence: 0.9
       }
-    } catch (error) {
-      logger.error('Error generating AI response:', error)
+    } catch (error: any) {
+      logger.error('Error generating AI response:', {
+        message: error?.message,
+        status: error?.status || error?.statusCode,
+        code: error?.code,
+        response: error?.response?.data || error?.response,
+        stack: error?.stack
+      })
 
-      // Fallback response
-      return {
-        content: "Je suis désolé, je rencontre un problème technique. Pouvez-vous reformuler votre question ?",
-        confidence: 0.5
+      // Check for specific error types and throw them properly
+      const errorMessage = error?.message || error?.toString() || ''
+      
+      if (errorMessage.includes('quota') || errorMessage.includes('QUOTA_EXCEEDED') || 
+          error?.status === 429 || error?.statusCode === 429 || error?.code === 429) {
+        throw new Error("QUOTA_EXCEEDED: Désolé, j'ai atteint ma limite de requêtes pour ce mois. Veuillez réessayer le mois prochain ou contactez le support pour plus d'informations.")
+      } else if (errorMessage.includes('API key') || errorMessage.includes('AUTH_ERROR') || 
+                 error?.status === 400 || error?.statusCode === 400 || error?.status === 403 || error?.statusCode === 403) {
+        throw new Error("AUTH_ERROR: Désolé, je rencontre un problème d'authentification avec le service IA. Veuillez contacter le support technique.")
+      } else {
+        // Re-throw the original error with more context
+        throw new Error(`AI_SERVICE_ERROR: ${errorMessage}`)
       }
     }
   }
@@ -215,16 +252,19 @@ Réponds directement et utilement en français.`
   }
 
   // Generate course notes using AI
-  static async generateNotes(content: string, lessonTitle: string, courseTitle: string): Promise<{ notes: string[] }> {
+  static async generateNotes(content: string, lessonTitle: string, courseTitle: string, transcription?: string): Promise<{ notes: string[] }> {
+    // Use transcription if available, otherwise use content
+    const sourceContent = transcription || content
+    
     const prompt = `
       Vous êtes un assistant IA spécialisé dans l'éducation du français. 
-      Générez des notes de cours structurées et utiles basées sur le contenu suivant:
+      Générez des notes de cours structurées et utiles basées sur la transcription suivante:
       
       Cours: ${courseTitle}
       Leçon: ${lessonTitle}
-      Contenu: ${content}
+      Transcription: ${sourceContent}
       
-      Veuillez générer 5-7 notes clés qui résument les points importants de cette leçon.
+      Veuillez générer 5-7 notes clés qui résument les points importants de cette leçon basées sur la transcription.
       Chaque note doit être concise (1-2 phrases) et pédagogique.
       Format de réponse: Liste de notes, une par ligne, sans numérotation.
     `
@@ -253,7 +293,13 @@ Réponds directement et utilement en français.`
     questionCount: number = 5,
     questionTypes: string[] = ["multiple-choice", "true-false", "short-answer"],
     category?: string,
-    difficulty?: string
+    difficulty?: string,
+    transcription?: string,
+    audioUrl?: string | null,
+    videoUrl?: string | null,
+    minWords?: number,
+    maxWords?: number,
+    writingType?: string
   ): Promise<{ questions: any[] }> {
     const difficultyInstructions = {
       "easy": "Questions simples et directes, vocabulaire basique, concepts fondamentaux",
@@ -263,10 +309,10 @@ Réponds directement et utilement en français.`
     }
 
     const categoryInstructions = {
-      "grammar": "Questions de grammaire française: conjugaisons, accords, syntaxe, temps verbaux",
-      "vocabulary": "Questions de vocabulaire: définitions, synonymes, antonymes, usage contextuel",
+      "grammar": "Questions de grammaire française: conjugaisons, accords, syntaxe, temps verbaux. Format TCF/TEF: MCQ avec 4 options, questions de complétion, transformations de phrases.",
+      "vocabulary": "Questions de vocabulaire: définitions, synonymes, antonymes, usage contextuel. Format TCF/TEF: MCQ avec 4 options, choix du bon mot dans le contexte, complétion de phrases.",
       "listening": "Questions de compréhension orale: détails, idées principales, contexte, ton",
-      "reading": "Questions de compréhension écrite: analyse de texte, inférence, structure",
+      "reading": "Questions de compréhension écrite: analyse de texte, inférence, structure. IMPORTANT: Le passage doit être SÉPARÉ de la question.",
       "writing": "Questions d'expression écrite: rédaction, style, cohérence",
       "oral": "Questions d'expression orale: prononciation, fluidité, communication"
     }
@@ -283,10 +329,13 @@ Réponds directement et utilement en français.`
       return { questions: [] };
     }
     
+    // Use transcription if available, otherwise use content
+    const sourceContent = transcription || content
+    
     // If content is too short, use title and description to generate meaningful questions
-    const effectiveContent = content.trim().length < 50 
-      ? `Le sujet d'examen "${content.trim()}" pour le cours "${courseTitle}" et la leçon "${lessonTitle}". ${categoryInstructions[category as keyof typeof categoryInstructions] || 'Questions générales de français.'}`
-      : content;
+    const effectiveContent = sourceContent.trim().length < 50 
+      ? `Le sujet d'examen "${sourceContent.trim()}" pour le cours "${courseTitle}" et la leçon "${lessonTitle}". ${categoryInstructions[category as keyof typeof categoryInstructions] || 'Questions générales de français.'}`
+      : sourceContent;
     
     console.log('📝 AI Generation Input:', {
       contentLength: content.length,
@@ -299,58 +348,26 @@ Réponds directement et utilement en français.`
       difficulty
     });
 
-    const prompt = `
-      Vous êtes un assistant IA spécialisé dans l'éducation du français et la préparation aux tests TCF/TEF.
-      Générez des questions COMPLÈTES et DÉTAILLÉES basées sur le contenu suivant.
-      
-      CONTEXTE IMPORTANT:
-      - Vous devez générer EXACTEMENT ${validQuestionCount} questions DÉTAILLÉES et UNIQUES
-      - Chaque question doit être COMPLÈTE et COMPRÉHENSIVE, couvrant toutes les informations essentielles
-      - Les questions doivent encourager des réponses élaborées, pas seulement des réponses courtes
-      - Chaque question doit aborder différents aspects du contenu (vocabulaire, grammaire, compréhension, expression)
-      - Les questions doivent être VARIÉES et DIFFÉRENTES les unes des autres
-      
-      Cours: ${courseTitle}
-      Leçon: ${lessonTitle}
-      Contenu: ${effectiveContent.substring(0, 8000)} ${effectiveContent.length > 8000 ? '...[contenu tronqué pour respecter les limites]' : ''}
-      Catégorie: ${category || 'générale'}
-      Niveau de difficulté: ${difficulty || 'moyen'} - ${difficultyInstructions[difficulty as keyof typeof difficultyInstructions] || 'niveau standard'}
-      
-      INSTRUCTIONS SPÉCIFIQUES:
-      1. Générez EXACTEMENT ${validQuestionCount} questions/SUJETS DÉTAILLÉS
-      2. Chaque question doit être LONGUE et COMPLÈTE (minimum 20-30 mots)
-      3. Chaque question doit couvrir des aspects ESSENTIELS du contenu
-      4. Les questions doivent varier en difficulté et en type
-      5. ${categoryInstructions[category as keyof typeof categoryInstructions] || 'Questions générales de français.'}
-      6. Niveau de difficulté: ${difficultyInstructions[difficulty as keyof typeof difficultyInstructions] || 'Questions de niveau standard.'}
-      
-      EXEMPLE DE QUESTION DÉTAILLÉE (à suivre):
-      "Pouvez-vous expliquer en détail les différents aspects de [sujet], en incluant les avantages, les inconvénients, et les implications pratiques pour [contexte]?"
-      
-      Format de réponse JSON:
-      {
-        "questions": [
-          {
-            "questionText": "Question COMPLÈTE et DÉTAILLÉE (minimum 20-30 mots, couvrant tous les aspects essentiels)",
-            "type": "multiple-choice",
-            "options": ["Option A détaillée", "Option B détaillée", "Option C détaillée", "Option D détaillée"],
-            "correctAnswer": 0,
-            "explanation": "Explication DÉTAILLÉE de la réponse (minimum 50 mots)",
-            "points": 1,
-            "category": "${category || 'GENERAL'}",
-            "level": "${difficulty || 'B1'}"
-          }
-        ]
-      }
-      
-      Types de questions supportés: ${questionTypes.join(", ")}
-      Pour les questions à choix multiples, fournissez 4 options DÉTAILLÉES et indiquez l'index de la bonne réponse (0-3).
-      Pour les questions vrai/faux, utilisez "true" ou "false" comme correctAnswer.
-      Pour les questions ouvertes, fournissez la réponse attendue DÉTAILLÉE comme correctAnswer.
-      
-      IMPORTANT: Assurez-vous que chaque question est COMPLÈTE, DÉTAILLÉE, et couvre les informations ESSENTIELLES du contenu.
-      Ne générez PAS de questions courtes ou superficielles. Chaque question doit permettre une réponse élaborée.
-    `
+    // Special handling for EXPRESSION_ECRITE (WRITING), LISTENING, and READING categories
+    const isExpressionEcrite = category === 'expression_ecrite' || category === 'writing' || category === 'WRITING';
+    const isListening = category === 'listening';
+    const isReading = category === 'reading';
+    
+    // Get Expression Écrite parameters (defaults if not provided)
+    const expressionEcriteMinWords = minWords || 150;
+    const expressionEcriteMaxWords = maxWords || 300;
+    const expressionEcriteWritingType = writingType || 'essay';
+    
+    let prompt: string;
+    if (isExpressionEcrite) {
+      prompt = this.getExpressionEcritePrompt(effectiveContent, courseTitle, lessonTitle, validQuestionCount, difficulty, questionTypes, expressionEcriteMinWords, expressionEcriteMaxWords, expressionEcriteWritingType);
+    } else if (isListening) {
+      prompt = this.getListeningComprehensionPrompt(effectiveContent, courseTitle, lessonTitle, validQuestionCount, difficulty, questionTypes, audioUrl, videoUrl);
+    } else if (isReading) {
+      prompt = this.getReadingComprehensionPrompt(effectiveContent, courseTitle, lessonTitle, validQuestionCount, difficulty, questionTypes);
+    } else {
+      prompt = this.getStandardPrompt(effectiveContent, courseTitle, lessonTitle, validQuestionCount, category, difficulty, questionTypes, categoryInstructions, difficultyInstructions);
+    }
 
     try {
       // validQuestionCount is already defined above
@@ -364,16 +381,29 @@ Réponds directement et utilement en français.`
       
       for (let batch = 0; batch < batches; batch++) {
         const currentBatchSize = batch === batches - 1 ? (validQuestionCount - allQuestions.length) : batchSize
-        const batchPrompt = prompt.replace(
-          `Générez EXACTEMENT ${validQuestionCount} questions/SUJETS DÉTAILLÉS`,
-          `Générez EXACTEMENT ${currentBatchSize} questions/SUJETS DÉTAILLÉS (lot ${batch + 1}/${batches})`
-        ).replace(
-          `Vous devez générer ${validQuestionCount} questions/SUJETS DÉTAILLÉS`,
-          `Vous devez générer ${currentBatchSize} questions/SUJETS DÉTAILLÉS pour ce lot (${batch + 1}/${batches})`
-        ).replace(
-          `Générez EXACTEMENT ${questionCount} questions DÉTAILLÉES et UNIQUES`,
-          `Générez EXACTEMENT ${currentBatchSize} questions DÉTAILLÉES et UNIQUES (lot ${batch + 1}/${batches})`
-        )
+        
+        // Update batch prompt - handle both vocabulary/grammar and standard prompts
+        let batchPrompt = prompt;
+        if (category === 'grammar' || category === 'vocabulary') {
+          batchPrompt = prompt.replace(
+            `Créez ${validQuestionCount} questions BASÉES sur ce passage`,
+            `Créez ${currentBatchSize} questions BASÉES sur ce passage (lot ${batch + 1}/${batches})`
+          ).replace(
+            `Générez EXACTEMENT ${validQuestionCount} questions avec passage séparé`,
+            `Générez EXACTEMENT ${currentBatchSize} questions avec passage séparé (lot ${batch + 1}/${batches})`
+          );
+        } else {
+          batchPrompt = prompt.replace(
+            `Générez EXACTEMENT ${validQuestionCount} questions/SUJETS DÉTAILLÉS`,
+            `Générez EXACTEMENT ${currentBatchSize} questions/SUJETS DÉTAILLÉS (lot ${batch + 1}/${batches})`
+          ).replace(
+            `Vous devez générer ${validQuestionCount} questions/SUJETS DÉTAILLÉS`,
+            `Vous devez générer ${currentBatchSize} questions/SUJETS DÉTAILLÉS pour ce lot (${batch + 1}/${batches})`
+          ).replace(
+            `Générez EXACTEMENT ${questionCount} questions DÉTAILLÉES et UNIQUES`,
+            `Générez EXACTEMENT ${currentBatchSize} questions DÉTAILLÉES et UNIQUES (lot ${batch + 1}/${batches})`
+          );
+        }
         
       const response = await geminiApiManager.generateContent(async (model) => {
           const result = await model.generateContent(batchPrompt)
@@ -399,7 +429,18 @@ Réponds directement et utilement en français.`
           const parsed = JSON.parse(cleanedJson)
           if (parsed.questions && Array.isArray(parsed.questions)) {
               console.log(`✅ Successfully parsed JSON response (Batch ${batch + 1}): ${parsed.questions.length} questions`)
-              allQuestions.push(...parsed.questions)
+              
+              // Handle passage field for vocabulary/grammar questions
+              const questionsWithPassage = parsed.questions.map((q: any) => {
+                // If there's a global passage, use it; otherwise use question-specific passage
+                const passage = q.passage || parsed.passage || null;
+                return {
+                  ...q,
+                  passage: passage // Add passage field to each question
+                };
+              });
+              
+              allQuestions.push(...questionsWithPassage)
               continue // Move to next batch
           }
         }
@@ -423,6 +464,7 @@ Réponds directement et utilement en français.`
                 options: questionType === "multiple-choice" ? this.generateRealisticOptions(effectiveContent, category, allQuestions.length + index) : [],
                 correctAnswer: questionType === "multiple-choice" ? Math.floor(Math.random() * 4) : questionType === "true-false" ? (Math.random() > 0.5 ? "true" : "false") : "Réponse attendue basée sur le contenu",
                 explanation: `Explication détaillée pour la question ${allQuestions.length + index + 1}`,
+                passage: null, // No passage for fallback questions
                 points: 1,
                 category: category || 'GENERAL',
                 level: difficulty || 'B1'
@@ -509,6 +551,7 @@ Réponds directement et utilement en français.`
             options: questionType === "multiple-choice" ? options : [],
             correctAnswer,
             explanation: `Explication détaillée et complète pour la question ${globalIndex + 1}, couvrant tous les aspects essentiels et les nuances importantes.`,
+            passage: null, // No passage for fallback questions
             points: 1,
             category: category || 'GENERAL',
             level: difficulty || 'B1'
@@ -661,6 +704,377 @@ Réponds directement et utilement en français.`
   }
 
   /**
+   * Get specialized prompt for Vocabulary and Grammar questions
+   * These categories need proper passage separation and TCF/TEF format
+   */
+  private static getVocabularyGrammarPrompt(
+    content: string,
+    courseTitle: string,
+    lessonTitle: string,
+    questionCount: number,
+    category: string,
+    difficulty: string,
+    questionTypes: string[]
+  ): string {
+    const categoryName = category === 'vocabulary' ? 'VOCABULAIRE' : 'GRAMMAIRE';
+    const categorySpecific = category === 'vocabulary' 
+      ? `Questions de vocabulaire français selon le format TCF/TEF:
+- MCQ: Choisir le bon mot dans le contexte (4 options)
+- Complétion: Compléter une phrase avec le mot approprié
+- Synonyme/Antonyme: Identifier les relations entre mots
+- Usage contextuel: Choisir le mot qui convient au registre de langue`
+      : `Questions de grammaire française selon le format TCF/TEF:
+- MCQ: Choisir la bonne forme verbale, accord, syntaxe (4 options)
+- Complétion: Compléter avec la bonne conjugaison/accord
+- Transformation: Transformer une phrase selon une règle grammaticale
+- Identification: Identifier l'erreur grammaticale`;
+
+    return `
+Vous êtes un expert en création de questions TCF/TEF pour le ${categoryName}.
+
+CONTENU SOURCE (extrait du PDF):
+"${content.substring(0, 6000)}${content.length > 6000 ? '...[contenu tronqué]' : ''}"
+
+MISSION CRITIQUE:
+1. EXTRACTION DU PASSAGE: Identifiez un passage de 50-150 mots dans le contenu source qui servira de CONTEXTE
+2. GÉNÉRATION DE QUESTIONS: Créez ${questionCount} questions BASÉES sur ce passage, mais les questions NE DOIVENT PAS répéter le passage
+
+RÈGLES ABSOLUES:
+- Le PASSAGE et la QUESTION doivent être COMPLÈTEMENT DIFFÉRENTS
+- Le passage = texte à lire/comprendre
+- La question = ce qui teste la compréhension/application
+- Format TCF/TEF strict: 4 options pour MCQ, une seule bonne réponse
+
+${categorySpecific}
+
+NIVEAU: ${difficulty || 'moyen'}
+TYPES DE QUESTIONS: ${questionTypes.join(', ')}
+
+FORMAT DE RÉPONSE JSON (OBLIGATOIRE):
+{
+  "passage": "Passage de 50-150 mots extrait du contenu (SÉPARÉ des questions)",
+  "questions": [
+    {
+      "passage": "Passage spécifique pour cette question (peut être le même pour toutes ou varier)",
+      "questionText": "Question courte et claire (10-20 mots max) selon format TCF/TEF",
+      "type": "multiple-choice",
+      "options": ["Option A", "Option B", "Option C", "Option D"],
+      "correctAnswer": 0,
+      "explanation": "Explication courte de la réponse (30-50 mots)",
+      "points": 1,
+      "category": "${category.toUpperCase()}",
+      "level": "${difficulty || 'B1'}"
+    }
+  ]
+}
+
+EXEMPLES POUR ${categoryName}:
+
+PASSAGE (exemple):
+"Le musée sera fermé lundi pour travaux. Les visiteurs devront attendre mardi pour la réouverture."
+
+QUESTION (correcte):
+"Quand le musée sera-t-il fermé ?"
+Options: ["Samedi", "Dimanche", "Lundi", "Mardi"]
+CorrectAnswer: 2
+
+QUESTION (incorrecte - NE PAS FAIRE):
+"Le musée sera fermé lundi pour travaux. Les visiteurs devront attendre mardi pour la réouverture. Quand le musée sera-t-il fermé ?"
+❌ Cette question répète le passage - INTERDIT!
+
+Générez EXACTEMENT ${questionCount} questions avec passage séparé.
+Réponds UNIQUEMENT avec le JSON valide.
+`;
+  }
+
+  /**
+   * Get specialized prompt for Expression Écrite (Writing - Vocabulaire + Grammaire)
+   * Students write articles, essays, or letters based on passages to test vocabulary and grammar
+   */
+  private static getExpressionEcritePrompt(
+    content: string,
+    courseTitle: string,
+    lessonTitle: string,
+    questionCount: number,
+    difficulty: string,
+    questionTypes: string[],
+    minWords: number,
+    maxWords: number,
+    writingType: string
+  ): string {
+    const writingTypeNames: Record<string, string> = {
+      'article': 'un article',
+      'essay': 'un essai',
+      'letter': 'une lettre'
+    };
+    const writingTypeName = writingTypeNames[writingType] || 'un texte';
+
+    return `
+Vous êtes un expert en création de prompts d'EXPRESSION ÉCRITE pour les tests TCF/TEF.
+
+CONTENU SOURCE (extrait du PDF/document):
+"${content.substring(0, 6000)}${content.length > 6000 ? '...[contenu tronqué]' : ''}"
+
+MISSION CRITIQUE:
+1. EXTRACTION DU PASSAGE: Identifiez un passage de 200-800 mots dans le contenu source qui servira de CONTEXTE pour l'écriture
+2. GÉNÉRATION DE PROMPTS D'ÉCRITURE: Créez ${questionCount} prompts d'expression écrite BASÉS sur ce passage
+3. TYPE D'ÉCRITURE: ${writingTypeName} (${writingType})
+4. LIMITES DE MOTS: Minimum ${minWords} mots, Maximum ${maxWords} mots
+
+RÈGLES ABSOLUES:
+- Le PASSAGE doit être LONG (200-800 mots) pour donner suffisamment de contexte
+- Le PROMPT doit demander à l'étudiant d'écrire ${writingTypeName} basé sur le passage
+- Le prompt doit tester le VOCABULAIRE et la GRAMMAIRE à travers l'écriture
+- Format TCF/TEF strict: prompts clairs et précis
+
+FORMAT DE RÉPONSE JSON (OBLIGATOIRE):
+{
+  "questions": [
+    {
+      "passage": "Passage de 200-800 mots extrait du contenu (contexte pour l'écriture)",
+      "questionText": "Prompt d'écriture: Écrivez ${writingTypeName} de ${minWords}-${maxWords} mots sur [sujet basé sur le passage]. Votre texte doit montrer une bonne maîtrise du vocabulaire et de la grammaire française.",
+      "type": "essay",
+      "options": [],
+      "correctAnswer": "Réponse attendue: ${writingTypeName} de ${minWords}-${maxWords} mots démontrant vocabulaire riche et grammaire correcte",
+      "explanation": "L'évaluation portera sur: vocabulaire (richesse, précision), grammaire (conjugaison, accords, syntaxe), structure (introduction, développement, conclusion), cohérence et pertinence.",
+      "points": 10,
+      "category": "WRITING",
+      "level": "${difficulty || 'B1'}"
+    }
+  ]
+}
+
+EXEMPLES DE PROMPTS D'EXPRESSION ÉCRITE:
+
+PASSAGE (exemple):
+"La technologie transforme notre façon de communiquer. Les réseaux sociaux permettent de rester en contact avec des amis éloignés, mais certains craignent que cela réduise les interactions en personne. Il est important de trouver un équilibre entre communication numérique et relations humaines authentiques."
+
+PROMPT ARTICLE (correct):
+"Écrivez un article de ${minWords}-${maxWords} mots sur l'impact des réseaux sociaux sur les relations humaines. Utilisez le passage ci-dessus comme point de départ. Votre article doit inclure une introduction, un développement avec des arguments, et une conclusion. Montrez votre maîtrise du vocabulaire et de la grammaire française."
+
+PROMPT ESSAI (correct):
+"Rédigez un essai de ${minWords}-${maxWords} mots analysant les avantages et inconvénients de la communication numérique. Basez-vous sur le passage fourni. Structurez votre essai avec une introduction, des paragraphes de développement, et une conclusion. Utilisez un vocabulaire riche et varié, et veillez à la correction grammaticale."
+
+PROMPT LETTRE (correct):
+"Écrivez une lettre de ${minWords}-${maxWords} mots à un ami pour discuter de votre opinion sur les réseaux sociaux et les relations humaines. Utilisez le passage comme inspiration. Votre lettre doit être formelle ou informelle selon le contexte, avec un vocabulaire approprié et une grammaire correcte."
+
+Générez EXACTEMENT ${questionCount} prompts d'expression écrite avec passages longs (200-800 mots).
+Réponds UNIQUEMENT avec le JSON valide.
+`;
+  }
+
+  /**
+   * Get specialized prompt for Listening Comprehension (Compréhension Orale)
+   * Questions generated from audio/video transcription
+   */
+  private static getListeningComprehensionPrompt(
+    transcription: string,
+    courseTitle: string,
+    lessonTitle: string,
+    questionCount: number,
+    difficulty: string,
+    questionTypes: string[],
+    audioUrl?: string | null,
+    videoUrl?: string | null
+  ): string {
+    return `
+Vous êtes un expert en création de questions TCF/TEF pour la COMPRÉHENSION ORALE.
+
+TRANSCRIPTION DU CONTENU AUDIO/VIDÉO:
+"${transcription.substring(0, 6000)}${transcription.length > 6000 ? '...[transcription tronquée]' : ''}"
+
+MISSION CRITIQUE:
+1. ANALYSE: Analysez la transcription pour identifier les points clés, détails, contexte, ton, et informations importantes
+2. GÉNÉRATION: Créez ${questionCount} questions BASÉES sur cette transcription selon le format TCF/TEF strict
+
+RÈGLES ABSOLUES POUR COMPRÉHENSION ORALE:
+- Format TCF/TEF: MCQ avec 4 options, une seule bonne réponse
+- Questions doivent tester: détails spécifiques, idées principales, contexte, ton, inférence
+- Les questions NE DOIVENT PAS répéter la transcription mot pour mot
+- Chaque question doit être claire et testable après une seule écoute
+- Options doivent être plausibles mais une seule est correcte
+
+TYPES DE QUESTIONS AUTORISÉS:
+- MCQ: Choisir la bonne réponse parmi 4 options après avoir écouté
+- True/False: Vrai ou Faux basé sur le contenu audio/vidéo
+
+NIVEAU: ${difficulty || 'moyen'}
+TYPES DE QUESTIONS: ${questionTypes.join(', ')}
+
+FORMAT DE RÉPONSE JSON (OBLIGATOIRE):
+{
+  "questions": [
+    {
+      "questionText": "Question courte et claire (10-20 mots max) selon format TCF/TEF",
+      "type": "multiple-choice",
+      "options": ["Option A", "Option B", "Option C", "Option D"],
+      "correctAnswer": 0,
+      "explanation": "Explication courte de la réponse (30-50 mots)",
+      "points": 1,
+      "category": "LISTENING",
+      "level": "${difficulty || 'B1'}"
+    }
+  ]
+}
+
+EXEMPLES POUR COMPRÉHENSION ORALE:
+
+TRANSCRIPTION (exemple):
+"Demain, il fera beau. On pourra aller à la plage. N'oubliez pas votre crème solaire."
+
+QUESTION (correcte):
+"Que prévoit la météo pour demain ?"
+Options: ["Il va pleuvoir", "Il va faire beau", "Il va neiger", "Il fera froid"]
+CorrectAnswer: 1
+
+Générez EXACTEMENT ${questionCount} questions robustes avec les bonnes réponses.
+Réponds UNIQUEMENT avec le JSON valide.
+`;
+  }
+
+  /**
+   * Get specialized prompt for Reading Comprehension (Compréhension Écrite)
+   * Questions generated from written passages with passage separation
+   */
+  private static getReadingComprehensionPrompt(
+    content: string,
+    courseTitle: string,
+    lessonTitle: string,
+    questionCount: number,
+    difficulty: string,
+    questionTypes: string[]
+  ): string {
+    return `
+Vous êtes un expert en création de questions TCF/TEF pour la COMPRÉHENSION ÉCRITE.
+
+CONTENU SOURCE (extrait du PDF):
+"${content.substring(0, 6000)}${content.length > 6000 ? '...[contenu tronqué]' : ''}"
+
+MISSION CRITIQUE:
+1. EXTRACTION DU PASSAGE: Identifiez un passage LONG de 500-2000+ mots dans le contenu source qui servira de TEXTE À LIRE
+   - Si le contenu est court, utilisez-le en entier
+   - Si le contenu est long, sélectionnez un passage cohérent de 500-2000 mots (plusieurs paragraphes)
+   - Le passage peut être le document entier si approprié
+2. GÉNÉRATION DE QUESTIONS: Créez ${questionCount} questions COMPLÈTES et COMPRÉHENSIVES BASÉES sur ce passage long, mais les questions NE DOIVENT PAS répéter le passage
+
+RÈGLES ABSOLUES POUR COMPRÉHENSION ÉCRITE:
+- Le PASSAGE et la QUESTION doivent être COMPLÈTEMENT DIFFÉRENTS
+- Le passage = texte LONG à lire/comprendre (500-2000+ mots, plusieurs paragraphes)
+- La question = ce qui teste la compréhension, l'inférence, les idées principales, les détails
+- Format TCF/TEF strict: 4 options pour MCQ, une seule bonne réponse
+- Questions doivent tester: idées principales, détails spécifiques, inférence, contexte, structure du texte
+
+TYPES DE QUESTIONS AUTORISÉS:
+- MCQ: Choisir la bonne réponse parmi 4 options après avoir lu le passage
+- True/False: Vrai ou Faux basé sur le contenu du passage
+- Short-answer: Réponse courte basée sur la compréhension du texte
+
+NIVEAU: ${difficulty || 'moyen'}
+TYPES DE QUESTIONS: ${questionTypes.join(', ')}
+
+FORMAT DE RÉPONSE JSON (OBLIGATOIRE):
+{
+  "passage": "Passage LONG de 500-2000+ mots extrait du contenu (SÉPARÉ des questions) - peut être plusieurs paragraphes",
+  "questions": [
+    {
+      "passage": "Passage LONG de 500-2000+ mots (peut être le même pour toutes les questions ou varier par section)",
+      "questionText": "Question complète et claire selon format TCF/TEF testant la compréhension approfondie du passage",
+      "type": "multiple-choice",
+      "options": ["Option A", "Option B", "Option C", "Option D"],
+      "correctAnswer": 0,
+      "explanation": "Explication courte de la réponse (30-50 mots)",
+      "points": 1,
+      "category": "READING",
+      "level": "${difficulty || 'B1'}"
+    }
+  ]
+}
+
+EXEMPLES POUR COMPRÉHENSION ÉCRITE:
+
+PASSAGE (exemple):
+"Le musée sera fermé lundi pour travaux. Les visiteurs devront attendre mardi pour la réouverture. Les travaux concernent la rénovation des salles d'exposition principale."
+
+QUESTION (correcte):
+"Quand le musée sera-t-il fermé ?"
+Options: ["Samedi", "Dimanche", "Lundi", "Mardi"]
+CorrectAnswer: 2
+
+QUESTION (correcte - inférence):
+"Quel est le but des travaux mentionnés dans le texte ?"
+Options: ["Agrandir le musée", "Rénover les salles", "Construire un nouveau bâtiment", "Réparer les toits"]
+CorrectAnswer: 1
+
+QUESTION (incorrecte - NE PAS FAIRE):
+"Le musée sera fermé lundi pour travaux. Les visiteurs devront attendre mardi pour la réouverture. Quand le musée sera-t-il fermé ?"
+❌ Cette question répète le passage - INTERDIT!
+
+Générez EXACTEMENT ${questionCount} questions robustes avec passage séparé.
+Réponds UNIQUEMENT avec le JSON valide.
+`;
+  }
+
+  /**
+   * Get standard prompt for other categories
+   */
+  private static getStandardPrompt(
+    content: string,
+    courseTitle: string,
+    lessonTitle: string,
+    questionCount: number,
+    category: string,
+    difficulty: string,
+    questionTypes: string[],
+    categoryInstructions: any,
+    difficultyInstructions: any
+  ): string {
+    return `
+      Vous êtes un assistant IA spécialisé dans l'éducation du français et la préparation aux tests TCF/TEF.
+      Générez des questions COMPLÈTES et DÉTAILLÉES basées sur le contenu suivant.
+      
+      CONTEXTE IMPORTANT:
+      - Vous devez générer EXACTEMENT ${questionCount} questions DÉTAILLÉES et UNIQUES
+      - Chaque question doit être COMPLÈTE et COMPRÉHENSIVE, couvrant toutes les informations essentielles
+      - Les questions doivent encourager des réponses élaborées, pas seulement des réponses courtes
+      - Chaque question doit aborder différents aspects du contenu (vocabulaire, grammaire, compréhension, expression)
+      - Les questions doivent être VARIÉES et DIFFÉRENTES les unes des autres
+      
+      Cours: ${courseTitle}
+      Leçon: ${lessonTitle}
+      Contenu: ${content.substring(0, 8000)} ${content.length > 8000 ? '...[contenu tronqué pour respecter les limites]' : ''}
+      Catégorie: ${category || 'générale'}
+      Niveau de difficulté: ${difficulty || 'moyen'} - ${difficultyInstructions[difficulty as keyof typeof difficultyInstructions] || 'niveau standard'}
+      
+      INSTRUCTIONS SPÉCIFIQUES:
+      1. Générez EXACTEMENT ${questionCount} questions/SUJETS DÉTAILLÉS
+      2. Chaque question doit être LONGUE et COMPLÈTE (minimum 20-30 mots)
+      3. Chaque question doit couvrir des aspects ESSENTIELS du contenu
+      4. Les questions doivent varier en difficulté et en type
+      5. ${categoryInstructions[category as keyof typeof categoryInstructions] || 'Questions générales de français.'}
+      6. Niveau de difficulté: ${difficultyInstructions[difficulty as keyof typeof difficultyInstructions] || 'Questions de niveau standard.'}
+      
+      Format de réponse JSON:
+      {
+        "questions": [
+          {
+            "questionText": "Question COMPLÈTE et DÉTAILLÉE",
+            "type": "multiple-choice",
+            "options": ["Option A", "Option B", "Option C", "Option D"],
+            "correctAnswer": 0,
+            "explanation": "Explication DÉTAILLÉE",
+            "points": 1,
+            "category": "${category || 'GENERAL'}",
+            "level": "${difficulty || 'B1'}"
+          }
+        ]
+      }
+      
+      Types de questions supportés: ${questionTypes.join(", ")}
+      Réponds UNIQUEMENT avec le JSON valide.
+    `;
+  }
+
+  /**
    * Generate realistic MCQ options based on content and category
    */
   private static generateRealisticOptions(content: string, category: string = 'general', questionIndex: number = 0): string[] {
@@ -743,25 +1157,49 @@ Réponds directement et utilement en français.`
     return { response }
   }
 
-  // Generate transcription for video content
+  // Generate transcription for video content with timestamps (YouTube-like format)
+  // NOTE: This is a temporary solution using AI. For real transcription, we need to:
+  // 1. Extract audio from video URL
+  // 2. Use Google Speech-to-Text or Whisper API for actual transcription
+  // 3. Generate timestamps from word-level timestamps
   static async generateTranscription(videoUrl: string, lessonTitle: string, courseTitle: string): Promise<{ transcription: string }> {
-    const prompt = `
-      Vous êtes un assistant IA spécialisé dans la transcription de cours de français.
+    // Try to extract meaningful context from video URL and titles
+    const videoContext = videoUrl.includes('tcf') || videoUrl.includes('tef') 
+      ? 'TCF/TEF preparation' 
+      : videoUrl.includes('grammar') || lessonTitle.toLowerCase().includes('grammaire')
+      ? 'French grammar lesson'
+      : videoUrl.includes('vocabulary') || lessonTitle.toLowerCase().includes('vocabulaire')
+      ? 'French vocabulary lesson'
+      : 'French language lesson'
 
-      Contexte:
-      - Titre du cours: ${courseTitle}
-      - Titre de la leçon: ${lessonTitle}
+    const prompt = `
+      Vous êtes un assistant IA spécialisé dans la transcription précise de cours de français avec timestamps, similaire à YouTube.
+
+      Contexte de la vidéo:
+      - Titre du cours: "${courseTitle}"
+      - Titre de la leçon: "${lessonTitle}"
+      - Type de contenu: ${videoContext}
       - URL de la vidéo: ${videoUrl}
 
-      Générez une transcription réaliste et éducative pour cette leçon de français.
+      IMPORTANT: Générez une transcription RÉALISTE et DÉTAILLÉE qui correspond vraiment au contenu d'une leçon de français sur "${lessonTitle}".
       La transcription doit être:
-      - En français
-      - Éducative et pédagogique
-      - Adaptée au niveau du cours
-      - Structurée avec des paragraphes
-      - D'environ 200-300 mots
+      - En français naturel et conversationnel (comme un vrai professeur parlerait)
+      - Spécifique au sujet "${lessonTitle}" - ne pas être générique
+      - Éducative avec des exemples concrets
+      - Formatée avec des timestamps au format [MM:SS] au début de chaque segment
+      - Chaque segment représente 10-20 secondes de parole naturelle
+      - Environ 8-15 segments pour une leçon de 2-4 minutes
+      - Les timestamps doivent être progressifs et réalistes (ex: [0:05], [0:18], [0:35], [0:52], [1:08], etc.)
+      - Le contenu doit être cohérent et progressif (introduction → explication → exemples → conclusion)
 
-      Format de réponse: Transcription directe du contenu de la leçon.
+      Format de réponse EXACT (chaque ligne = un segment):
+      [0:05] Texte de transcription du premier segment...
+      [0:18] Texte de transcription du deuxième segment...
+      [0:35] Texte de transcription du troisième segment...
+      etc.
+
+      CRITIQUE: Chaque ligne DOIT commencer par [MM:SS] suivi d'un espace, puis le texte réel de ce qui serait dit dans la vidéo sur "${lessonTitle}".
+      Le texte doit être spécifique au sujet, pas générique.
     `
 
     try {
@@ -774,9 +1212,9 @@ Réponds directement et utilement en français.`
       return { transcription: response }
     } catch (error) {
       console.error('Error generating transcription:', error)
-      // Return a fallback transcription
+      // Return a fallback transcription with timestamps
       return {
-        transcription: `Transcription de la leçon "${lessonTitle}" du cours "${courseTitle}". Cette leçon couvre les concepts fondamentaux de la langue française et fournit des exemples pratiques pour améliorer votre compréhension. Le contenu est structuré pour faciliter l'apprentissage et la rétention des informations clés.`
+        transcription: `[0:05] Bonjour à tous ! Aujourd'hui, nous allons parler de "${lessonTitle}".\n[0:12] C'est un sujet très important en français.\n[0:37] Cette leçon couvre les concepts fondamentaux de la langue française.\n[0:58] Nous allons voir des exemples pratiques pour améliorer votre compréhension.\n[1:15] Le contenu est structuré pour faciliter l'apprentissage.\n[1:30] Nous allons maintenant passer à la pratique.`
       }
     }
   }

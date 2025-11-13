@@ -119,6 +119,97 @@ router.post('/upload',
 );
 
 /**
+ * @route POST /api/content-management/upload-bulk
+ * @desc Upload multiple videos as lessons in a single course
+ * @access Private (Admin, Senior Manager, Junior Manager)
+ */
+const uploadBulk = multer({
+  storage,
+  limits: {
+    fileSize: 10 * 1024 * 1024 * 1024, // 10GB per file
+    files: 20 // Maximum 20 files
+  },
+  fileFilter: (req, file, cb) => {
+    const allowedTypes = [
+      'video/mp4',
+      'video/avi',
+      'video/mov',
+      'video/webm'
+    ];
+
+    if (allowedTypes.includes(file.mimetype)) {
+      cb(null, true);
+    } else {
+      cb(new ValidationError('Invalid file type. Only video files are allowed.'));
+    }
+  }
+});
+
+router.post('/upload-bulk',
+  authenticate,
+  uploadBulk.array('files', 20),
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const {
+        title,
+        description,
+        level,
+        category,
+        subscriptionTier,
+        availableLevels,
+        availableTiers,
+        tags
+      } = req.body;
+
+      // Validate required fields
+      if (!title || !description || !level || !category || !subscriptionTier) {
+        return res.status(400).json({
+          success: false,
+          message: 'Missing required fields: title, description, level, category, subscriptionTier'
+        });
+      }
+
+      if (!req.files || (req.files as Express.Multer.File[]).length === 0) {
+        return res.status(400).json({
+          success: false,
+          message: 'At least one file is required'
+        });
+      }
+
+      const files = req.files as Express.Multer.File[];
+      const parsedAvailableLevels = availableLevels ? JSON.parse(availableLevels) : [level];
+      const parsedAvailableTiers = availableTiers ? JSON.parse(availableTiers) : [subscriptionTier];
+
+      const result = await ContentManagementService.uploadBulkCourseContent(
+        title,
+        description,
+        level,
+        category,
+        subscriptionTier,
+        parsedAvailableLevels,
+        parsedAvailableTiers,
+        files.map(f => ({
+          path: f.path,
+          mimetype: f.mimetype,
+          originalname: f.originalname
+        })),
+        req.user!.id,
+        req.user!.role,
+        tags ? JSON.parse(tags) : []
+      );
+
+      res.json({
+        success: true,
+        data: result,
+        message: `Course created successfully with ${result.lessons} lessons`
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+/**
  * @route GET /api/content-management/test-cloudinary
  * @desc Test Cloudinary configuration
  * @access Private (Admin, Senior Manager)

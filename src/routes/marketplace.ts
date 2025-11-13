@@ -26,11 +26,12 @@ router.get('/tutors', authenticate, async (req: Request, res: Response, next: Ne
       });
     }
 
-    // Get tutor profiles (managers and admins) - include both ACTIVE and ONLINE users
+    // Get tutor profiles (managers and admins) - fetch ALL regardless of status
+    // Status filter removed: we want to show all activated profiles, then display their actual status
     const tutors = await prisma.user.findMany({
       where: {
-        role: { in: ['ADMIN', 'SENIOR_MANAGER', 'JUNIOR_MANAGER'] },
-        status: { in: ['ACTIVE', 'ONLINE'] }
+        role: { in: ['ADMIN', 'SENIOR_MANAGER', 'JUNIOR_MANAGER'] }
+        // Removed status filter - fetch all and filter by marketplaceProfile.isActive only
       },
       select: {
         id: true,
@@ -39,7 +40,9 @@ router.get('/tutors', authenticate, async (req: Request, res: Response, next: Ne
         email: true,
         role: true,
         profilePicture: true,
+        profileImage: true, // Include profileImage field
         preferences: true, // CRITICAL: Must select preferences to check marketplaceProfile.isActive
+        status: true, // Include status to display correct online/offline status
         createdAt: true,
         // Add tutor-specific fields if they exist
       }
@@ -94,12 +97,18 @@ router.get('/tutors', authenticate, async (req: Request, res: Response, next: Ne
       
       const marketplaceProfile = (preferences as any).marketplaceProfile || {};
       
+      // Determine online status: ONLY ONLINE status means user is currently online
+      // ACTIVE = user has account (not necessarily online)
+      // ONLINE = user is currently logged in/online on platform
+      // OFFLINE = user has account but not online
+      const displayStatus = tutor.status || 'OFFLINE'; // Use actual status from DB
+      
       return {
         id: tutor.id,
         name: `${tutor.firstName} ${tutor.lastName}`,
         email: tutor.email,
         role: tutor.role,
-        profilePicture: tutor.profilePicture,
+        profilePicture: tutor.profileImage || tutor.profilePicture, // Prioritize profileImage, fallback to profilePicture
         bio: marketplaceProfile.bio || `Expert formateur en français langue étrangère`,
         specialties: Array.isArray(marketplaceProfile.specialties) ? marketplaceProfile.specialties : ['Grammaire', 'Expression Orale'],
         languages: Array.isArray(marketplaceProfile.languages) ? marketplaceProfile.languages : ['Français', 'English'],
@@ -109,7 +118,9 @@ router.get('/tutors', authenticate, async (req: Request, res: Response, next: Ne
         rating: 4.5 + Math.random() * 0.5, // Mock rating
         reviewCount: Math.floor(Math.random() * 100) + 10,
         responseTime: '< 24h',
-        isAvailable: true
+        isAvailable: true,
+        status: displayStatus, // CRITICAL: Include status for frontend online/offline check
+        isActive: marketplaceProfile.isActive === true
       };
     });
 

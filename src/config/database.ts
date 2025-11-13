@@ -8,9 +8,12 @@ const getDatabaseUrl = () => {
   }
   
   // Add connection pool parameters if not already present
+  // Increased for 800+ concurrent users
   const url = new URL(baseUrl);
   if (!url.searchParams.has('connection_limit')) {
-    url.searchParams.set('connection_limit', '20');
+    // Increased from 20 to 100 for better concurrency
+    // Formula: (concurrent_users / 10) + buffer = (800/10) + 20 = 100
+    url.searchParams.set('connection_limit', '100');
   }
   if (!url.searchParams.has('pool_timeout')) {
     url.searchParams.set('pool_timeout', '60');

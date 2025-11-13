@@ -28,8 +28,9 @@ export const temporaryAuthMiddleware = async (
   next: NextFunction
 ) => {
   try {
-    // Check if there's a temporary token in query parameters or headers
-    const token = (req.query.token as string) || (req.headers['x-token'] as string) || (req.headers.authorization?.replace('Bearer ', ''));
+    // Check if there's a temporary token in query parameters or x-token header ONLY
+    // Do NOT check authorization header here - that's for regular JWT tokens
+    const token = (req.query.token as string) || (req.headers['x-token'] as string);
     
     if (!token) {
       // No temporary token, proceed with normal authentication
@@ -135,8 +136,14 @@ export const simulationAccessMiddleware = (simulationType: 'voice' | 'immigratio
           hasAccess = true;
         }
       } else if (req.user) {
-        // Regular authentication
-        userId = req.user.id;
+        // Regular authentication - check both id and userId fields
+        userId = (req.user as any).userId || req.user.id;
+        if (!userId) {
+          return res.status(401).json({
+            success: false,
+            message: 'User ID not found in token'
+          });
+        }
         hasAccess = true; // Will be verified below
       } else {
         return res.status(401).json({
@@ -256,10 +263,37 @@ export const simulationAccessMiddleware = (simulationType: 'voice' | 'immigratio
 
 /**
  * Combined middleware that handles both temporary auth and simulation access
+ * If no temporary token, falls back to regular authentication
  */
 export const temporaryOrRegularAuth = (simulationType: 'voice' | 'immigration') => {
-  return [
-    temporaryAuthMiddleware,
-    simulationAccessMiddleware(simulationType)
-  ];
+  return async (req: Request, res: Response, next: NextFunction) => {
+    // Check if there's a temporary token in query or x-token header (NOT authorization header)
+    const tempToken = (req.query.token as string) || (req.headers['x-token'] as string);
+    
+    if (tempToken) {
+      // Try temporary auth first
+      await temporaryAuthMiddleware(req, res, async () => {
+        // If temporary auth succeeded, proceed with simulation access check
+        if (req.user || req.temporaryAuth) {
+          await simulationAccessMiddleware(simulationType)(req, res, next);
+        } else {
+          // Temporary token was invalid, try regular auth
+          const { authenticate } = await import('./auth');
+          // authenticate is synchronous, wrap it properly
+          authenticate(req, res, () => {
+            // After authentication succeeds, proceed with simulation access check
+            simulationAccessMiddleware(simulationType)(req, res, next);
+          });
+        }
+      });
+    } else {
+      // No temporary token, use regular authentication (JWT from Authorization header)
+      const { authenticate } = await import('./auth');
+      // authenticate is synchronous, wrap it properly
+      authenticate(req, res, () => {
+        // After authentication succeeds, proceed with simulation access check
+        simulationAccessMiddleware(simulationType)(req, res, next);
+      });
+    }
+  };
 };

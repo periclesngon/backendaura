@@ -29,15 +29,47 @@ export class AiChatService {
     context: ChatContext
   ): Promise<ChatResponse> {
     try {
-      // Get or create chat session
-      let session = chatId 
-        ? await prisma.chatSession.findUnique({ where: { id: chatId } })
-        : null
+      // Get user data to populate context if missing
+      const user = await prisma.user.findUnique({
+        where: { id: userId },
+        select: { currentLevel: true, preferences: true }
+      })
 
-      if (!session) {
+      // Ensure context has required fields with defaults
+      const safeContext: ChatContext = {
+        userLevel: context?.userLevel || user?.currentLevel || 'BASIC',
+        language: context?.language || 'fr',
+        previousMessages: context?.previousMessages || [],
+        ...context
+      }
+
+      // Get or create chat session - only create new if chatId is null/undefined
+      let session = null
+      
+      if (chatId) {
+        // Try to find existing session
+        session = await prisma.chatSession.findFirst({
+          where: { 
+            id: chatId,
+            userId: userId // Ensure it belongs to the user
+          }
+        })
+        
+        if (!session) {
+          // Session not found or doesn't belong to user, create new one
+          session = await prisma.chatSession.create({
+            data: {
+              userId,
+              title: this.generateSessionTitle(message),
+              isActive: true
+            }
+          })
+        }
+      } else {
+        // No chatId provided, create new session
         session = await prisma.chatSession.create({
           data: {
-        userId,
+            userId,
             title: this.generateSessionTitle(message),
             isActive: true
           }
@@ -50,17 +82,17 @@ export class AiChatService {
           sessionId: session.id,
           role: 'USER',
           content: message,
-          metadata: { context }
+          metadata: { context: safeContext }
         }
       })
 
-      // Get relevant questions from question bank
-      const relevantQuestions = await this.getRelevantQuestions(message, context)
+      // Get relevant questions from question bank - REDUCED for speed
+      const relevantQuestions = await this.getRelevantQuestions(message, safeContext).then(questions => questions.slice(0, 2)).catch(() => []) // Limit to 2 questions max, fallback to empty array
       
       // Generate AI response with Gemini AI and question bank context
       const aiResponse = await this.generateAIResponse(
         message, 
-        context, 
+        safeContext, 
         relevantQuestions,
         session.id
       )
@@ -75,7 +107,7 @@ export class AiChatService {
           confidence: aiResponse.confidence,
           metadata: { 
             questionBankUsed: relevantQuestions.length > 0,
-            context 
+            context: safeContext 
           }
         }
       })
@@ -87,9 +119,24 @@ export class AiChatService {
         chatId: session.id
       }
 
-    } catch (error) {
-      logger.error('Error in AiChatService.sendMessage:', error)
-      throw error
+    } catch (error: any) {
+      logger.error('Error in AiChatService.sendMessage:', {
+        error: error?.message || error,
+        stack: error?.stack,
+        name: error?.name,
+        code: error?.code,
+        status: error?.status || error?.statusCode,
+        fullError: JSON.stringify(error, Object.getOwnPropertyNames(error))
+      })
+      
+      // If it's a quota or auth error, throw it as-is
+      if (error?.message?.includes('QUOTA_EXCEEDED') || error?.message?.includes('AUTH_ERROR')) {
+        throw error
+      }
+      
+      // For other errors, wrap them with a more specific message
+      const errorMsg = error?.message || error?.toString() || 'Failed to process message'
+      throw new Error(`AI_SERVICE_ERROR: ${errorMsg}`)
     }
   }
 
@@ -161,16 +208,63 @@ export class AiChatService {
   }
 
   /**
-   * Get relevant questions from question bank based on user message
+   * Get relevant questions from question bank - ONLY for difficult TCF/TEF questions
    */
   private static async getRelevantQuestions(message: string, context: ChatContext) {
     try {
-      // Extract keywords from message
-      const keywords = this.extractKeywords(message)
+      const messageLower = message.toLowerCase().trim()
       
-      // Search question bank for relevant questions
-      const questions = await QuestionBankService.searchQuestions(message, 5)
-
+      // Skip question bank for simple conversational questions
+      // Check if message is too short first
+      if (messageLower.length < 15) {
+        return [] // Skip question bank for very short messages
+      }
+      
+      const simplePatterns = [
+        // Greetings
+        'salut', 'bonjour', 'bonsoir', 'hey', 'hi', 'hello', 'ça va', 'ca va',
+        // Basic questions
+        'ton nom', 'your name', 'comment tu t\'appelles', 'what is your name',
+        'que sais tu', 'what can you', 'que peux tu', 'what do you',
+        'quel jour', 'what day', 'quelle date', 'what date', 'aujourd\'hui', 'today',
+        'comment allez', 'how are you', 'comment ça va'
+      ]
+      
+      // Check if it's a simple question
+      if (simplePatterns.some(pattern => messageLower.includes(pattern))) {
+        return [] // Skip question bank for simple questions
+      }
+      
+      // Check if question is TCF/TEF related
+      const tcfTefKeywords = [
+        'tcf', 'tef', 'examen', 'test', 'simulation', 'épreuve',
+        'grammaire', 'grammar', 'vocabulaire', 'vocabulary',
+        'compréhension', 'comprehension', 'expression', 'speaking',
+        'écoute', 'listening', 'écrit', 'writing', 'oral',
+        'niveau', 'level', 'exercice', 'exercise', 'pratique', 'practice',
+        'conjugaison', 'conjugation', 'accord', 'agreement', 'temps', 'tense',
+        'subjonctif', 'subjunctive', 'conditionnel', 'conditional',
+        'immigration', 'canada', 'france', 'belgique', 'suisse'
+      ]
+      
+      const isTcfTefRelated = tcfTefKeywords.some(keyword => messageLower.includes(keyword))
+      
+      // Only search question bank for TCF/TEF related questions
+      if (!isTcfTefRelated) {
+        return [] // Skip question bank for non-TCF/TEF questions
+      }
+      
+      // Check if question seems difficult (longer, complex vocabulary)
+      const isDifficult = messageLower.length > 30 || 
+                         ['explique', 'explain', 'différence', 'difference', 'pourquoi', 'why', 'comment', 'how'].some(w => messageLower.includes(w))
+      
+      // Only use question bank for difficult TCF/TEF questions
+      if (!isDifficult) {
+        return [] // Skip question bank for easy TCF/TEF questions
+      }
+      
+      // Search question bank for difficult TCF/TEF questions only
+      const questions = await QuestionBankService.searchQuestions(message, 2)
       return questions
     } catch (error) {
       logger.error('Error getting relevant questions:', error)
@@ -179,7 +273,7 @@ export class AiChatService {
   }
 
   /**
-   * Generate AI response with question bank context
+   * Generate AI response with question bank context - ROBUST with fallbacks
    */
   private static async generateAIResponse(
     message: string,
@@ -188,83 +282,147 @@ export class AiChatService {
     sessionId: string
   ) {
     try {
-      // Build context for AI
-      const systemPrompt = this.buildSystemPrompt(context, relevantQuestions)
+      // Build context for AI with safe defaults
+      const systemPrompt = this.buildSystemPrompt(context, relevantQuestions || [])
       
-      // Get recent conversation history
-      const recentMessages = await prisma.chatMessage.findMany({
-        where: { sessionId },
-        orderBy: { createdAt: 'desc' },
-        take: 10
-      })
+      // Get recent conversation history - REDUCED to 5 for speed, with error handling
+      let recentMessages: any[] = []
+      try {
+        recentMessages = await prisma.chatMessage.findMany({
+          where: { sessionId },
+          orderBy: { createdAt: 'desc' },
+          take: 5 // Reduced from 10 to 5 for faster processing
+        })
+      } catch (dbError) {
+        logger.warn('Error fetching conversation history, continuing without it:', dbError)
+        recentMessages = []
+      }
 
-      // Generate response using Gemini AI service with question bank context
-      const response = await AIService.generateResponse({
-        message,
-        systemPrompt,
-        context: {
-          userLevel: context.userLevel,
-          language: context.language,
-          relevantQuestions,
-          conversationHistory: recentMessages.reverse()
+      // Generate response using Mistral AI service (with Gemini fallback) with question bank context
+      let response: any
+      try {
+        response = await AIService.generateResponse({
+          message,
+          systemPrompt,
+          context: {
+            userLevel: context.userLevel || 'BASIC',
+            language: context.language || 'fr',
+            relevantQuestions: relevantQuestions || [],
+            conversationHistory: recentMessages.reverse()
+          }
+        })
+      } catch (aiError: any) {
+        logger.error('Error calling AIService.generateResponse:', {
+          error: aiError?.message || aiError,
+          status: aiError?.status || aiError?.statusCode,
+          code: aiError?.code
+        })
+        
+        // Check if it's a quota/auth error - these should be thrown
+        const errorMessage = aiError?.message || ''
+        if (errorMessage.includes('QUOTA_EXCEEDED') || errorMessage.includes('AUTH_ERROR')) {
+          throw aiError // Re-throw quota/auth errors
         }
-      })
+        
+        // For other errors, return fallback
+        logger.warn('AI service unavailable, returning fallback response')
+        return {
+          message: 'Désolé, le service IA est temporairement indisponible. Veuillez réessayer dans quelques instants.',
+          sources: [],
+          confidence: 0.5
+        }
+      }
+
+      // Ensure we have a valid response
+      if (!response || !response.content) {
+        logger.warn('AI response is empty, returning fallback')
+        return {
+          message: 'Désolé, je n\'ai pas pu générer de réponse. Veuillez réessayer.',
+          sources: [],
+          confidence: 0.5
+        }
+      }
 
       return {
-        message: response.content,
-        sources: this.extractSources(response, relevantQuestions),
+        message: response.content.trim() || 'Désolé, je n\'ai pas pu générer de réponse. Veuillez réessayer.',
+        sources: this.extractSources(response, relevantQuestions || []),
         confidence: response.confidence || 0.8
       }
 
-    } catch (error) {
-      logger.error('Error generating AI response:', error)
-      return {
-        message: "Désolé, je rencontre un problème technique. Veuillez réessayer.",
-        sources: [],
-        confidence: 0.1
+    } catch (error: any) {
+      logger.error('Error generating AI response:', {
+        error: error?.message || error,
+        message,
+        sessionId,
+        context: { userLevel: context.userLevel, language: context.language }
+      })
+      
+      // Check for specific error types
+      const errorMessage = error?.message || error?.toString() || ''
+      
+      if (errorMessage.includes('quota') || errorMessage.includes('limit') || errorMessage.includes('rate limit')) {
+        throw new Error("QUOTA_EXCEEDED: Désolé, j'ai atteint ma limite de requêtes pour ce mois. Veuillez réessayer le mois prochain ou contactez le support pour plus d'informations.")
+      } else if (errorMessage.includes('API key') || errorMessage.includes('authentication')) {
+        throw new Error("AUTH_ERROR: Désolé, je rencontre un problème d'authentification avec le service IA. Veuillez contacter le support technique.")
+      } else {
+        // Return a fallback response instead of throwing
+        return {
+          message: 'Désolé, je rencontre un problème technique. Veuillez réessayer dans quelques instants.',
+          sources: [],
+          confidence: 0.5
+        }
       }
     }
   }
 
   /**
-   * Build system prompt with question bank context
+   * Build system prompt with question bank context - IMPROVED for natural responses
    */
   private static buildSystemPrompt(context: ChatContext, relevantQuestions: any[]) {
-    const currentDate = new Date().toLocaleDateString('fr-FR', {
-      weekday: 'long',
-      year: 'numeric',
-      month: 'long',
-      day: 'numeric'
-    })
-    const currentTime = new Date().toLocaleTimeString('fr-FR', {
-      hour: '2-digit',
-      minute: '2-digit'
-    })
+    const currentDate = new Date()
+    const currentHour = currentDate.getHours()
+    const currentDay = currentDate.toLocaleDateString('fr-FR', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })
     
-    const basePrompt = `Tu es l'assistant IA d'Aura.ca, alimenté par Gemini AI et spécialisé dans l'aide aux étudiants pour le TCF/TEF.
+    // Natural greeting based on time
+    let greetingInstruction = ''
+    if (currentHour >= 5 && currentHour < 12) {
+      greetingInstruction = 'Matin: Utilise "Bonjour" de manière naturelle. Varie tes salutations.'
+    } else if (currentHour >= 12 && currentHour < 17) {
+      greetingInstruction = 'Après-midi: Utilise "Bonjour" ou "Salut" naturellement. Varie tes réponses.'
+    } else if (currentHour >= 17 && currentHour < 21) {
+      greetingInstruction = 'Soir: Utilise "Bonsoir" naturellement. Varie tes réponses.'
+    } else {
+      greetingInstruction = 'Nuit: Utilise "Bonsoir" naturellement. Varie tes réponses.'
+    }
+    
+    // Safe defaults for context
+    const userLevel = context?.userLevel || 'BASIC'
+    const language = context?.language || 'fr'
+    
+    // IMPROVED PROMPT for natural, varied responses
+    const basePrompt = `Tu es Aura, l'assistant IA intelligent de Aura.ca, spécialisé dans la préparation TCF/TEF pour les Camerounais et Africains.
 
-INFORMATION ACTUELLE:
-- Date d'aujourd'hui: ${currentDate}
-- Heure actuelle: ${currentTime}
+CONTEXTE:
+- Date actuelle: ${currentDay}
+- Niveau de l'utilisateur: ${userLevel}
+- Langue: ${language === 'fr' ? 'français' : 'anglais'}
 
-Ton rôle:
-- Aider les étudiants avec leurs questions sur le français en utilisant la puissance de Gemini AI
-- Fournir des explications claires et pédagogiques
-- Utiliser les questions de la banque de données TCF/TEF pour enrichir tes réponses
-- Adapter ton niveau de langue au niveau de l'étudiant (${context.userLevel})
-- Répondre en ${context.language === 'fr' ? 'français' : 'anglais'}
-- Tu as accès à la date et heure actuelles pour répondre aux questions temporelles
+RÈGLES IMPORTANTES:
+1. Salutations: ${greetingInstruction} NE RÉPÈTE PAS toujours "Salut!" au début. Varie tes réponses naturellement.
+2. Personnalité: Sois amical, professionnel et encourageant. Réponds de manière naturelle et variée.
+3. Formatage: JAMAIS d'astérisques (*) ou de markdown. Écris naturellement comme dans une conversation.
+4. Longueur: Adapte-toi à la question. Questions simples: réponse courte et directe. Questions complexes: réponse détaillée.
+5. Informations: Si on te demande la date/jour, utilise la date réelle: ${currentDay}
+6. Variété: Change tes formulations. Ne commence pas toujours par "Salut!".`
 
-Contexte de l'utilisateur:
-- Niveau: ${context.userLevel}
-- Langue préférée: ${context.language}`
-
+    // Only include question bank context for difficult TCF/TEF questions
     if (relevantQuestions.length > 0) {
       const questionsContext = `
-Questions pertinentes de la banque de données:
-${relevantQuestions.map((q, i) => `${i + 1}. ${q.questionText} (Niveau: ${q.level})`).join('\n')}
 
-Utilise ces questions comme référence pour donner des exemples concrets et des exercices similaires.`
+QUESTIONS TCF/TEF PERTINENTES (utilise-les comme référence pour des exemples concrets):
+${relevantQuestions.map((q, i) => `${i + 1}. ${q.questionText || q.title} (Niveau: ${q.level || 'N/A'})`).join('\n')}
+
+IMPORTANT: Utilise ces questions uniquement comme référence pour donner des exemples similaires et des exercices pratiques. Ne les répète pas mot pour mot.`
       
       return basePrompt + questionsContext
     }

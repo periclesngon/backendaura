@@ -424,26 +424,36 @@ class QuestionBankService {
     }
   }
 
-  // Search questions by keywords
+  // Search questions by keywords - ROBUST with error handling
   async searchQuestions(query: string, limit: number = 5): Promise<any[]> {
     try {
+      if (!query || typeof query !== 'string' || query.trim().length === 0) {
+        return [];
+      }
+
+      // Try to find questions, but don't fail if table doesn't exist
       const questions = await prisma.questionBank.findMany({
         where: {
           OR: [
-            { title: { contains: query, mode: 'insensitive' } },
-            { description: { contains: query, mode: 'insensitive' } },
-            { level: { equals: query as any } }
+            { title: { contains: query.trim(), mode: 'insensitive' } },
+            { description: { contains: query.trim(), mode: 'insensitive' } },
+            { level: { equals: query.trim() as any } }
           ],
           isActive: true
         },
-        take: limit,
+        take: Math.min(limit, 10), // Cap at 10 for safety
         orderBy: { createdAt: 'desc' }
+      }).catch((error) => {
+        // If table doesn't exist or query fails, return empty array
+        console.warn('QuestionBank search failed, returning empty array:', error?.message || error);
+        return [];
       });
 
-      return questions;
+      return questions || [];
     } catch (error) {
-      console.error('Error searching questions:', error);
-      throw error;
+      // Always return empty array instead of throwing
+      console.warn('Error searching questions, returning empty array:', error);
+      return [];
     }
   }
 }

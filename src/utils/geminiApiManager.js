@@ -79,8 +79,10 @@ class GeminiApiManager {
     for (let attempt = 0; attempt < maxRetries; attempt++) {
       try {
         const client = this.getClient();
+        // Use gemini-pro-latest as it's available in v1beta API
+        // gemini-1.5-flash is not available in v1beta, need to use v1 API or gemini-pro-latest
         const model = client.getGenerativeModel({
-          model: 'gemini-2.0-flash-exp',
+          model: 'gemini-pro-latest', // Available in v1beta API
           generationConfig: {
             maxOutputTokens: 2048,
             temperature: 0.7,
@@ -105,7 +107,18 @@ class GeminiApiManager {
       } catch (error) {
         lastError = error;
 
-        if (error.status === 429) {
+        // Log detailed error information
+        console.error(`❌ Gemini API Error (Attempt ${attempt + 1}/${maxRetries}):`, {
+          status: error.status,
+          statusCode: error.statusCode,
+          code: error.code,
+          message: error.message,
+          response: error.response?.data || error.response,
+          keyIndex: this.currentKeyIndex + 1,
+          totalKeys: this.apiKeys.length
+        });
+
+        if (error.status === 429 || error.statusCode === 429 || error.code === 429) {
           // Quota exceeded for current key
           console.log(`⚠️ Quota exceeded for API key ${this.currentKeyIndex + 1}, trying next key...`);
 
@@ -116,13 +129,25 @@ class GeminiApiManager {
           const nextKeyIndex = this.getAvailableKeyIndex();
           if (nextKeyIndex === -1) {
             console.log('🚨 All API keys exhausted');
-            break;
+            throw new Error('QUOTA_EXCEEDED: All API keys have exceeded their quota. Please wait for reset or add more keys.');
           }
 
           continue; // Try with next key
+        } else if (error.status === 400 || error.statusCode === 400 || error.code === 400) {
+          // Bad request - likely API key issue or invalid request
+          console.error(`❌ Bad request error - API key may be invalid or request format is wrong`);
+          throw new Error(`AUTH_ERROR: Invalid API key or request format: ${error.message}`);
+        } else if (error.status === 403 || error.statusCode === 403 || error.code === 403) {
+          // Forbidden - API key doesn't have permission
+          console.error(`❌ Forbidden error - API key may not have required permissions`);
+          throw new Error(`AUTH_ERROR: API key does not have required permissions: ${error.message}`);
         } else {
           // Other error, don't retry
           console.error(`❌ API request failed:`, error.message);
+          // Continue to next attempt if we have retries left
+          if (attempt < maxRetries - 1) {
+            continue;
+          }
           break;
         }
       }

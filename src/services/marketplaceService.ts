@@ -99,10 +99,12 @@ export class MarketplaceService {
       // Check activation status - must be explicitly true
       const isActive = marketplaceProfile.isActive === true;
       
-      // Determine online status for managers/admins - same logic as getAllTutors
-      // Managers and Admins with ACTIVE status should always show as ONLINE (like admins)
-      const isCurrentlyOnline = user.status === 'ONLINE' || user.status === 'ACTIVE';
-      const displayStatus = isCurrentlyOnline ? 'ONLINE' : 'OFFLINE';
+      // Determine online status: ONLY ONLINE status means user is currently online
+      // ACTIVE = user has account (not necessarily online)
+      // ONLINE = user is currently logged in/online on platform
+      // OFFLINE = user has account but not online
+      const isCurrentlyOnline = user.status === 'ONLINE';
+      const displayStatus = user.status || 'OFFLINE'; // Use actual status from DB
       
       // Get location from marketplace profile first, then user.city
       const profileLocation = marketplaceProfile.location || user.city || null;
@@ -376,10 +378,12 @@ export class MarketplaceService {
     try {
       console.log('📚 Fetching all tutors for marketplace...');
       
+      // Fetch ALL managers/admins regardless of status
+      // Status filter removed: we want to show all activated profiles, then display their actual status
       const tutors = await prisma.user.findMany({
         where: {
-          role: { in: ['ADMIN', 'SENIOR_MANAGER', 'JUNIOR_MANAGER'] },
-          status: { in: ['ACTIVE', 'ONLINE'] } // Include both ACTIVE and ONLINE users
+          role: { in: ['ADMIN', 'SENIOR_MANAGER', 'JUNIOR_MANAGER'] }
+          // Removed status filter - fetch all and filter by marketplaceProfile.isActive only
         },
         select: {
           id: true,
@@ -392,6 +396,7 @@ export class MarketplaceService {
           role: true,
           status: true,
           profilePicture: true,
+          profileImage: true, // Include profileImage field
           preferences: true,
           createdAt: true,
           lastActivityAt: true,
@@ -405,17 +410,30 @@ export class MarketplaceService {
       });
 
       console.log(`✅ Found ${tutors.length} total tutors (ADMIN, SENIOR_MANAGER, JUNIOR_MANAGER)`);
+      
+      // Log all tutors found for debugging
+      tutors.forEach(tutor => {
+        console.log(`📋 Tutor found: ${tutor.email} (${tutor.role}, status=${tutor.status})`);
+      });
 
       // Filter tutors to only include those with ACTIVATED marketplace profiles
-      // Only ADMIN and SENIOR_MANAGER with isActive === true are shown
+      // ADMIN users are ALWAYS included (they should always be visible)
+      // SENIOR_MANAGER must have isActive === true
       // JUNIOR_MANAGER is excluded (only for Pro users)
       const activatedTutors = tutors.filter(user => {
+        // ADMIN users are ALWAYS included - they should always be visible
+        if (user.role === 'ADMIN') {
+          console.log(`✅ Including ADMIN ${user.email} (${user.firstName} ${user.lastName}) - always visible, status=${user.status}`);
+          return true;
+        }
+        
         // Only ADMIN and SENIOR_MANAGER are eligible
-        if (user.role !== 'ADMIN' && user.role !== 'SENIOR_MANAGER') {
+        if (user.role !== 'SENIOR_MANAGER') {
           console.log(`⚠️ Excluding ${user.email} - role: ${user.role}`);
           return false;
         }
         
+        // For SENIOR_MANAGER, check if marketplace profile is activated
         // Safely parse preferences (handle null, string, or object)
         let preferences: any = {};
         try {
@@ -435,9 +453,8 @@ export class MarketplaceService {
         const isActive = marketplaceProfile.isActive;
         
         console.log(`🔍 Checking ${user.email} (${user.role}): isActive=${isActive}, type=${typeof isActive}, strict=${isActive === true}`);
-        console.log(`   Full preferences:`, JSON.stringify(preferences, null, 2));
         
-        // Must be explicitly activated (isActive === true)
+        // SENIOR_MANAGER must be explicitly activated (isActive === true)
         // Do NOT default to true - must be explicitly set
         const passes = isActive === true;
         if (!passes) {
@@ -450,9 +467,17 @@ export class MarketplaceService {
       
       if (activatedTutors.length === 0) {
         console.warn('⚠️ WARNING: No activated tutors found! Check if profiles are activated.');
-        console.log('📋 All tutors found:', tutors.map(u => `${u.email} (${u.role}, isActive=${(JSON.parse(u.preferences as string || '{}')).marketplaceProfile?.isActive})`));
+        console.log('📋 All tutors found:', tutors.map(u => {
+          let prefs: any = {};
+          try {
+            if (u.preferences) {
+              prefs = typeof u.preferences === 'string' ? JSON.parse(u.preferences) : u.preferences;
+            }
+          } catch (e) {}
+          return `${u.email} (${u.role}, status=${u.status}, isActive=${prefs.marketplaceProfile?.isActive})`;
+        }));
       } else {
-        console.log('📋 Activated tutors:', activatedTutors.map(u => `${u.email} (${u.role})`));
+        console.log('📋 Activated tutors:', activatedTutors.map(u => `${u.email} (${u.firstName} ${u.lastName}, ${u.role}, status=${u.status})`));
       }
 
       const tutorProfiles: TutorProfile[] = activatedTutors.map(user => {
@@ -487,14 +512,12 @@ export class MarketplaceService {
           ? [marketplaceProfile.specialties] 
           : []; // Empty array if not set - must be set by tutor
         
-        // Determine online status: 
-        // - If status is ONLINE, show as online
-        // - Managers and Admins with ACTIVE status should always show as ONLINE (like admins)
-        // - ACTIVE status means they're online for managers/admins
-        const isCurrentlyOnline = user.status === 'ONLINE' || user.status === 'ACTIVE';
-        
-        // Use ONLINE status if currently online or ACTIVE, otherwise use OFFLINE
-        const displayStatus = isCurrentlyOnline ? 'ONLINE' : 'OFFLINE';
+        // Determine online status: ONLY ONLINE status means user is currently online
+        // ACTIVE = user has account (not necessarily online)
+        // ONLINE = user is currently logged in/online on platform
+        // OFFLINE = user has account but not online
+        const isCurrentlyOnline = user.status === 'ONLINE';
+        const displayStatus = user.status || 'OFFLINE'; // Use actual status from DB
         
         // Get location from marketplace profile, then user.city, then null
         const tutorLocation = marketplaceProfile.location || user.city || null;
@@ -515,7 +538,7 @@ export class MarketplaceService {
           acceptsMessages: acceptsMessages, // Whether tutor accepts messages from students
           specialties: specialties, // Must be set in marketplace profile
           location: tutorLocation, // Real location from profile or user.city
-          profilePicture: user.profilePicture || null, // Fetch from user profile
+          profilePicture: user.profileImage || user.profilePicture || null, // Prioritize profileImage, fallback to profilePicture
           status: displayStatus, // CRITICAL: Include status for frontend online/offline check
           isActive: isActive, // CRITICAL: Include isActive in response
           languages: Array.isArray(marketplaceProfile.languages) 

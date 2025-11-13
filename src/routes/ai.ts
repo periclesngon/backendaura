@@ -1,10 +1,11 @@
 import express, { Request, Response, NextFunction } from 'express';
 import { prisma } from '@/database/connection';
+import { UserRole } from '@prisma/client';
 import multer from 'multer';
 import path from 'path';
 import fs from 'fs';
 import pdfParse from 'pdf-parse';
-import { authenticate } from '../middleware/auth';
+import { authenticate, authorize } from '../middleware/auth';
 import { LevelDeterminationService } from '../services/levelDeterminationService';
 import { AIService } from '../services/aiService';
 
@@ -859,7 +860,8 @@ router.post('/generate-notes', authenticate, async (req: Request, res: Response,
       });
     }
 
-    const result = await AIService.generateNotes(content, lessonTitle, courseTitle);
+    const { transcription } = req.body;
+    const result = await AIService.generateNotes(content, lessonTitle, courseTitle, transcription);
     
     res.json({
       success: true,
@@ -898,6 +900,7 @@ router.post('/generate-questions', authenticate, async (req: Request, res: Respo
     // Validate question count
     const validQuestionCount = Math.min(Math.max(1, questionCount), 30);
 
+    const { transcription, minWords, maxWords, writingType } = req.body;
     const result = await AIService.generateQuestions(
       content,
       lessonTitle,
@@ -905,7 +908,13 @@ router.post('/generate-questions', authenticate, async (req: Request, res: Respo
       validQuestionCount,
       questionTypes,
       category,
-      difficulty
+      difficulty,
+      transcription,
+      undefined, // audioUrl
+      undefined, // videoUrl
+      minWords,
+      maxWords,
+      writingType
     );
 
     console.log('✅ AI Questions Generated:', {
@@ -1043,6 +1052,7 @@ router.post('/generate-questions-from-file', authenticate, upload.single('file')
     );
 
     // Format questions properly for storage in QuestionBank
+    // Handle passage field for vocabulary/grammar questions
     const formattedQuestions = (result.questions || []).map((q: any, index: number) => ({
       id: `q_${Date.now()}_${index}`,
       question: q.questionText || q.question || q.text || '',
@@ -1054,7 +1064,8 @@ router.post('/generate-questions-from-file', authenticate, upload.single('file')
       points: q.points || 1,
       keywords: q.keywords || [],
       difficulty: q.difficulty || 5,
-      explanation: q.explanation || ''
+      explanation: q.explanation || '',
+      passage: q.passage || null // Include passage field (from question object)
     }));
 
     // Clean up uploaded file
@@ -1081,6 +1092,76 @@ router.post('/generate-questions-from-file', authenticate, upload.single('file')
       fs.unlinkSync(req.file.path);
     }
     console.error('❌ Error generating questions from file:', error);
+    next(error);
+  }
+});
+
+/**
+ * @route   POST /api/ai/generate-questions-from-media
+ * @desc    Generate questions from audio/video for listening comprehension
+ * @access  Private (Admin/Manager)
+ */
+router.post('/generate-questions-from-media', authenticate, authorize(UserRole.ADMIN, UserRole.SENIOR_MANAGER, UserRole.JUNIOR_MANAGER), async (req, res, next) => {
+  try {
+    const { audioUrl, videoUrl, lessonTitle, courseTitle, level, category, difficulty, questionCount, questionTypes } = req.body;
+
+    if (!audioUrl && !videoUrl) {
+      return res.status(400).json({
+        success: false,
+        error: {
+          message: 'Audio URL or Video URL is required'
+        }
+      });
+    }
+
+    if (!lessonTitle || !level || !category) {
+      return res.status(400).json({
+        success: false,
+        error: {
+          message: 'Missing required fields: lessonTitle, level, category'
+        }
+      });
+    }
+
+    console.log('🎧 Generating questions from media:', {
+      audioUrl: audioUrl ? 'provided' : 'none',
+      videoUrl: videoUrl ? 'provided' : 'none',
+      lessonTitle,
+      courseTitle,
+      level,
+      category,
+      difficulty,
+      questionCount
+    });
+
+    // Use AIService to generate questions from audio/video
+    // The service will handle transcription and question generation
+    const result = await AIService.generateQuestions(
+      '', // No text content - will use audio/video transcription
+      lessonTitle,
+      courseTitle || lessonTitle,
+      level,
+      category,
+      difficulty || 'medium',
+      questionCount || 5,
+      questionTypes || ['multiple-choice', 'true-false'],
+      audioUrl || null,
+      videoUrl || null
+    );
+
+    res.json({
+      success: true,
+      data: {
+        questions: result.questions || [],
+        metadata: {
+          totalQuestions: result.questions?.length || 0,
+          source: audioUrl ? 'audio' : 'video',
+          sourceUrl: audioUrl || videoUrl
+        }
+      }
+    });
+  } catch (error: any) {
+    console.error('❌ Error generating questions from media:', error);
     next(error);
   }
 });

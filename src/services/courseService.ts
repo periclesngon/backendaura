@@ -221,11 +221,8 @@ export class CourseService {
         where.requiredTier = tier;
       }
 
-      // Get total count
-      const total = await prisma.course.count({ where });
-
-      // Get courses
-      const courses = await prisma.course.findMany({
+      // Get all courses first (we'll filter and deduplicate in code)
+      const allCourses = await prisma.course.findMany({
         where,
         include: {
           createdBy: {
@@ -263,21 +260,79 @@ export class CourseService {
             }
           }
         },
-        orderBy: { [sortBy]: sortOrder },
-        skip: (page - 1) * limit,
-        take: limit
+        orderBy: { [sortBy]: sortOrder }
       });
 
+      // Get user's subscription tier for access control
+      let userSubscriptionTier: SubscriptionTier = SubscriptionTier.FREE;
+      if (userId) {
+        const user = await prisma.user.findUnique({
+          where: { id: userId },
+          select: { subscriptionTier: true }
+        });
+        if (user?.subscriptionTier) {
+          userSubscriptionTier = user.subscriptionTier;
+        }
+      }
+
+      // Filter by subscription tier (access control) and deduplicate by title
+      const courseMap = new Map<string, any>();
+      
+      for (const course of allCourses) {
+        // Check access: student's subscription must be in course's availableSubscriptions
+        const availableSubs = (course as any).availableSubscriptions && (course as any).availableSubscriptions.length > 0
+          ? (course as any).availableSubscriptions
+          : [course.requiredTier];
+        
+        const hasAccess = availableSubs.includes(userSubscriptionTier);
+        
+        if (!hasAccess) continue; // Skip courses user can't access
+        
+        // Deduplicate by title - normalize title (trim, lowercase) to catch all duplicates
+        const normalizedTitle = course.title.trim().toLowerCase();
+        
+        // Keep only the first course with this title (prefer one with more lessons or more recent)
+        if (!courseMap.has(normalizedTitle)) {
+          courseMap.set(normalizedTitle, course);
+        } else {
+          // If duplicate found, keep the one with more lessons or more recent
+          const existing = courseMap.get(normalizedTitle);
+          const existingLessons = existing?.lessons_data?.length || 0;
+          const currentLessons = course.lessons_data?.length || 0;
+          
+          // Prefer course with more lessons, or if equal, keep the more recent one
+          if (currentLessons > existingLessons || 
+              (currentLessons === existingLessons && course.createdAt > existing.createdAt)) {
+            courseMap.set(normalizedTitle, course);
+          }
+        }
+      }
+
+      const uniqueCourses = Array.from(courseMap.values());
+      
+      // Apply pagination after deduplication
+      const total = uniqueCourses.length;
       const totalPages = Math.ceil(total / limit);
+      const paginatedCourses = uniqueCourses.slice((page - 1) * limit, page * limit);
 
       // Add computed fields
-      const coursesWithDetails: CourseWithDetails[] = courses.map(course => {
-        // Calculate real duration from lesson durations
-        const realDuration = course.lessons_data.reduce((total, lesson) => total + (lesson.duration || 0), 0);
+      const coursesWithDetails: CourseWithDetails[] = paginatedCourses.map(course => {
+        // ALWAYS calculate real duration from lesson durations - NEVER use stored course.duration
+        // Sum all lesson durations to get actual course duration
+        const realDuration = course.lessons_data && course.lessons_data.length > 0
+          ? course.lessons_data.reduce((total, lesson) => {
+              const lessonDuration = lesson.duration || 0
+              return total + lessonDuration
+            }, 0)
+          : 0; // If no lessons, duration is 0
         
         return {
           ...course,
-          duration: realDuration, // Use calculated duration instead of stored duration
+          duration: realDuration, // Use calculated duration in minutes (from lessons_data only)
+          lessons_data: course.lessons_data, // Explicitly include lessons_data
+          availableLevels: (course as any).availableLevels || [course.level], // Include availableLevels for filtering
+          availableSubscriptions: (course as any).availableSubscriptions || [course.requiredTier], // Include availableSubscriptions
+          thumbnail: course.thumbnail, // Include thumbnail for video thumbnails
           userProgress: course.progress?.[0],
           isFavorited: false, // Will be calculated separately if needed
           isEnrolled: course.enrollments.length > 0,

@@ -171,19 +171,21 @@ class ImmigrationSimulationService {
         }
       });
 
-      // Create session in database - store scheduledDate in personalInfo JSON
+      // Create session in database - store scheduledDate in both field and personalInfo JSON
       const session = await prisma.immigrationSimulation.create({
         data: {
           userId,
           country: country.toUpperCase(),
           immigrationType,
           level: level || 'B1',
-          status: bookingType === 'AUTO' ? 'SCHEDULED' : 'CREATED',
+          status: bookingType === 'AUTO' ? 'SCHEDULED' : 'SCHEDULED', // Use SCHEDULED for both
+          scheduledDate: scheduledDateTime, // Store in dedicated field
           personalInfo: JSON.stringify(personalInfoWithMetadata),
           questions: JSON.stringify(questions),
           responses: JSON.stringify({}),
           currentQuestionIndex: 0,
-          duration: 300, // 5 minutes for voice simulation
+          duration: 300, // 5 minutes
+          questionsData: questionsDataStored, // Store questionsData in dedicated field
           createdAt: new Date()
         }
       });
@@ -241,7 +243,7 @@ class ImmigrationSimulationService {
         immigrationType,
         scenario: scenario.name,
         description: scenario.description,
-        status: bookingType === 'AUTO' ? 'SCHEDULED' : 'CREATED',
+        status: 'SCHEDULED', // Always SCHEDULED (will be marked EXPIRED by cron if past)
         duration: 300,
         totalQuestions: questions.length,
         welcomeMessage: this.generateWelcomeMessage(country, immigrationType, level),
@@ -338,7 +340,10 @@ class ImmigrationSimulationService {
    */
   static async startSession(sessionId, userId) {
     try {
-      const session = await prisma.immigrationSimulation.findFirst({
+      // Use transaction to prevent race conditions when multiple users click simultaneously
+      const result = await prisma.$transaction(async (tx) => {
+        // Lock the simulation row and check status atomically
+        const session = await tx.immigrationSimulation.findFirst({
         where: { id: sessionId, userId }
       });
 
@@ -346,9 +351,34 @@ class ImmigrationSimulationService {
         throw new NotFoundError('Immigration session not found');
       }
 
-      if (session.status !== 'CREATED' && session.status !== 'SCHEDULED') {
-        throw new ValidationError('Session has already been started');
-      }
+        // Check status atomically - prevents race conditions
+        if (session.status !== 'SCHEDULED') {
+          throw new ValidationError(`Simulation is not in scheduled status. Current status: ${session.status}`);
+        }
+
+        // Immediately update status to ACTIVE to prevent duplicate starts
+        // This acts as a distributed lock for concurrent requests
+        const updatedSimulation = await tx.immigrationSimulation.update({
+          where: { 
+            id: sessionId,
+            status: 'SCHEDULED' // Only update if still SCHEDULED (optimistic locking)
+          },
+          data: {
+            status: 'ACTIVE' // Lock the simulation
+          }
+        });
+
+        if (!updatedSimulation) {
+          throw new ValidationError('Simulation was already started by another request');
+        }
+
+        return { simulation: updatedSimulation };
+      }, {
+        timeout: 10000, // 10 second timeout for transaction
+        isolationLevel: 'Serializable' // Highest isolation level to prevent race conditions
+      });
+
+      const session = result.simulation;
 
       // Get VAPI service
       const { default: vapiService } = await import('./vapiService');
@@ -407,7 +437,11 @@ class ImmigrationSimulationService {
       const questions = JSON.parse(session.questions || '[]');
       
       // Create VAPI assistant for immigration
-      const assistant = await vapiService.createImmigrationAssistant(
+      // Wrap in try-catch to handle VAPI rate limits gracefully
+      let assistant;
+      let call;
+      try {
+        assistant = await vapiService.createImmigrationAssistant(
         voiceId,
         session.country.toLowerCase(),
         session.immigrationType,
@@ -415,8 +449,21 @@ class ImmigrationSimulationService {
         'fr'
       );
 
-      // Start VAPI call
-      const call = await vapiService.startVoiceSimulation(sessionId, assistant.id);
+        // Start VAPI call with retry logic for rate limits
+        call = await vapiService.startVoiceSimulation(sessionId, assistant.id);
+      } catch (vapiError) {
+        // If VAPI fails, revert simulation status to SCHEDULED
+        await prisma.immigrationSimulation.update({
+          where: { id: sessionId },
+          data: { status: 'SCHEDULED' }
+        });
+        
+        // Re-throw with more context
+        throw new Error(
+          `Failed to start VAPI call: ${vapiError.message || 'Unknown error'}. ` +
+          `This may be due to rate limiting. Please try again in a moment.`
+        );
+      }
 
       // Create active session for tracking (similar to voice simulation)
       const activeSession = {
@@ -443,14 +490,14 @@ class ImmigrationSimulationService {
       // Store active session for function calls
       activeImmigrationSessions.set(sessionId, activeSession);
 
-      // Update session with VAPI info
+      // Update session with VAPI info (status already ACTIVE from transaction)
       const updatedSession = await prisma.immigrationSimulation.update({
         where: { id: sessionId },
         data: {
-          status: 'ACTIVE',
           startedAt: new Date(),
           vapiSessionId: call.id,
           vapiAssistantId: assistant.id
+          // Status is already ACTIVE from the transaction above
         }
       });
 
@@ -871,18 +918,35 @@ class ImmigrationSimulationService {
         }))
       });
 
-      // Transform simulations to match frontend expectations
-      return simulationsWithDates.map((sim) => ({
+      // Transform simulations to match frontend expectations with dynamic status correction
+      const now = new Date();
+      return simulationsWithDates.map((sim) => {
+        // Dynamic status correction: SCHEDULED + past scheduledDate → EXPIRED
+        // EXPIRED + future scheduledDate → SCHEDULED
+        let displayStatus = sim.status;
+        const scheduledDate = sim.scheduledDate ? new Date(sim.scheduledDate) : null;
+        
+        if (scheduledDate) {
+          if (sim.status === 'SCHEDULED' && scheduledDate < now) {
+            displayStatus = 'EXPIRED';
+          } else if (sim.status === 'EXPIRED' && scheduledDate >= now) {
+            displayStatus = 'SCHEDULED';
+          }
+        }
+        
+        return {
         id: sim.id,
         country: sim.country,
         category: sim.immigrationType,
-        status: sim.status,
+          status: displayStatus,
+          originalStatus: sim.status, // Keep original for reference
         score: sim.finalScore,
         duration: sim.duration || 300, // Default 5 minutes in seconds
         createdAt: sim.createdAt,
         scheduledDate: sim.scheduledDate ? sim.scheduledDate.toISOString() : null,
         completedAt: sim.completedAt
-      }));
+        };
+      });
     } catch (error) {
       logger.error('Failed to get user immigration simulations', { userId, error });
       throw error;
@@ -1068,11 +1132,16 @@ class ImmigrationSimulationService {
       currentMonth.setDate(1);
       currentMonth.setHours(0, 0, 0, 0);
 
+      // Only count COMPLETED simulations with AI feedback (valid simulations)
       return await prisma.immigrationSimulation.count({
         where: {
           userId,
+          status: 'COMPLETED',
           createdAt: {
             gte: currentMonth
+          },
+          aiFeedbacks: {
+            some: {} // Has at least one AI feedback
           }
         }
       });
@@ -1187,29 +1256,31 @@ class ImmigrationSimulationService {
         );
       }
 
-      // Parse personalInfo to update scheduledDate
-      let personalInfoParsed = {};
-      try {
-        personalInfoParsed = typeof simulation.personalInfo === 'string' 
-          ? JSON.parse(simulation.personalInfo) 
-          : (simulation.personalInfo || {});
-      } catch (e) {
-        console.warn('Failed to parse personalInfo for reschedule:', e);
+      // Allow rescheduling for SCHEDULED, ACTIVE, and EXPIRED sessions
+      // Only block COMPLETED and CANCELLED
+      if (simulation.status === 'COMPLETED' || simulation.status === 'CANCELLED') {
+        throw new ValidationError(
+          language === 'fr'
+            ? 'Cette simulation ne peut pas être reprogrammée'
+            : 'This simulation cannot be rescheduled'
+        );
       }
 
-      // Update scheduledDate and voicePreference in personalInfo
-      personalInfoParsed.scheduledDate = newDate.toISOString();
-      if (voicePreference) {
-        personalInfoParsed.voicePreference = voicePreference;
+      // Update simulation - if it was EXPIRED, change status to SCHEDULED
+      const updateData = {
+        scheduledDate: newDate,
+        updatedAt: new Date()
+      };
+
+      // If simulation was EXPIRED, change status to SCHEDULED
+      if (simulation.status === 'EXPIRED') {
+        updateData.status = 'SCHEDULED';
       }
 
-      // Update simulation with new scheduledDate stored in personalInfo
+      // Update simulation with new scheduledDate
       const rescheduledSimulation = await prisma.immigrationSimulation.update({
         where: { id: simulation.id },
-        data: { 
-          status: 'SCHEDULED',
-          personalInfo: JSON.stringify(personalInfoParsed)
-        }
+        data: updateData
       });
 
       // Send rescheduling confirmation email
@@ -1220,13 +1291,33 @@ class ImmigrationSimulationService {
         });
 
         if (user) {
-          await this.sendBookingConfirmation({
-            ...rescheduledSimulation,
-            user,
+          // Use email service for rescheduling confirmation
+          const { EmailService } = await import('./emailService');
+          
+          // Generate temporary token for access link
+          const { default: TemporaryTokenService } = await import('./temporaryTokenService');
+          const token = await TemporaryTokenService.generateToken(
+            userId,
+            rescheduledSimulation.id,
+            'immigration',
+            new Date(Date.now() + 24 * 60 * 60 * 1000) // 24 hours
+          );
+          
+          const simulationUrl = `${process.env.FRONTEND_URL || 'http://localhost:3000'}/immigration-simulations/${rescheduledSimulation.id}?token=${token}`;
+          
+          const emailData = {
+            to: user.email,
+            firstName: user.firstName || '',
+            lastName: user.lastName || '',
+            country: rescheduledSimulation.country,
+            immigrationType: rescheduledSimulation.immigrationType,
             scheduledDate: newDate,
-            voicePreference: voicePreference || personalInfoParsed.voicePreference,
-            questionsData: personalInfoParsed.questionsData
-          });
+            duration: `${Math.floor((rescheduledSimulation.duration || 300) / 60)} minutes`,
+            simulationId: rescheduledSimulation.id,
+            accessUrl: simulationUrl
+          };
+
+          await EmailService.sendImmigrationSimulationReschedulingEmail(emailData);
           console.log('✅ Rescheduling confirmation email sent');
         }
       } catch (emailError) {
@@ -1395,6 +1486,91 @@ class ImmigrationSimulationService {
         sessionId: session?.id,
         userEmail: session?.user?.email
       });
+      throw error;
+    }
+  }
+
+  /**
+   * Mark all expired immigration sessions (SCHEDULED sessions where scheduledDate has passed)
+   */
+  static async markExpiredImmigrationSessions() {
+    try {
+      const now = new Date();
+      
+      // Find SCHEDULED sessions where scheduledDate has passed
+      const scheduledExpiredCount = await prisma.immigrationSimulation.updateMany({
+        where: {
+          status: 'SCHEDULED',
+          scheduledDate: {
+            lt: now // scheduledDate is in the past
+          }
+        },
+        data: { 
+          status: 'EXPIRED'
+        }
+      });
+
+      // Also mark ACTIVE sessions that started more than 30 minutes ago and scheduledDate is past
+      const activeExpiredCount = await prisma.immigrationSimulation.updateMany({
+        where: {
+          status: 'ACTIVE',
+          scheduledDate: {
+            lt: new Date(Date.now() - 30 * 60 * 1000) // 30 minutes ago
+          }
+        },
+        data: { 
+          status: 'EXPIRED'
+        }
+      });
+
+      logger.info('Marked expired immigration sessions', {
+        scheduled: scheduledExpiredCount.count,
+        active: activeExpiredCount.count
+      });
+
+      return {
+        scheduled: scheduledExpiredCount.count,
+        active: activeExpiredCount.count
+      };
+    } catch (error) {
+      logger.error('Error marking expired immigration sessions', { error });
+      throw error;
+    }
+  }
+
+  /**
+   * Delete an immigration simulation (only CANCELLED simulations can be deleted)
+   */
+  static async deleteImmigrationSimulation(simulationId, userId, language = 'fr') {
+    try {
+      const simulation = await prisma.immigrationSimulation.findFirst({
+        where: { id: simulationId, userId }
+      });
+
+      if (!simulation) {
+        throw new NotFoundError(
+          language === 'fr'
+            ? 'Simulation d\'immigration introuvable'
+            : 'Immigration simulation not found'
+        );
+      }
+
+      if (simulation.status !== 'CANCELLED') {
+        throw new ValidationError(
+          language === 'fr'
+            ? 'Seules les simulations annulées peuvent être supprimées'
+            : 'Only cancelled simulations can be deleted'
+        );
+      }
+
+      await prisma.immigrationSimulation.delete({
+        where: { id: simulationId }
+      });
+
+      logger.info('Immigration simulation deleted', { simulationId, userId });
+      return { success: true };
+    } catch (error) {
+      logger.error('Failed to delete immigration simulation', { simulationId, userId, error });
       throw error;
     }
   }

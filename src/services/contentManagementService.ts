@@ -3,6 +3,7 @@ import { prisma } from '@/database/connection';
 import { logger } from '../utils/logger';
 import { NotFoundError, ValidationError, ForbiddenError } from '../utils/errors';
 import { CloudinaryService } from './cloudinaryService';
+import getVideoDuration from 'get-video-duration';
 // import { QuestionBankService } from './questionBankService';
 
 export interface ContentUploadData {
@@ -60,6 +61,7 @@ export interface ContentItem {
   levels?: CourseLevel[];
   subscriptions?: SubscriptionTier[];
   totalVariants?: number;
+  totalVideoCount?: number;
 }
 
 export class ContentManagementService {
@@ -93,6 +95,25 @@ export class ContentManagementService {
       // Upload file to Cloudinary if provided
       let extractedDuration: number | undefined = undefined;
       if (uploadData.file) {
+        // For videos, extract duration from file BEFORE upload (fallback if Cloudinary doesn't return it)
+        if (uploadData.contentType === 'VIDEO') {
+          try {
+            const durationInSeconds = await getVideoDuration(uploadData.file.path);
+            // Convert seconds to minutes (rounded to nearest minute)
+            extractedDuration = Math.round(durationInSeconds / 60);
+            logger.info('Video duration extracted from file', {
+              filePath: uploadData.file.path,
+              durationSeconds: durationInSeconds,
+              durationMinutes: extractedDuration
+            });
+          } catch (error) {
+            logger.warn('Failed to extract duration from video file, will try Cloudinary', {
+              filePath: uploadData.file.path,
+              error: error instanceof Error ? error.message : 'Unknown error'
+            });
+          }
+        }
+
         const uploadResult = await CloudinaryService.uploadFile(uploadData.file.path, {
           folder: `tcf-tef-platform/content/${uploadData.contentType.toLowerCase()}`,
           resource_type: this.getResourceType(uploadData.file.mimetype),
@@ -101,15 +122,42 @@ export class ContentManagementService {
 
         fileUrl = uploadResult.secure_url;
 
-        // Extract duration from Cloudinary for videos
-        if (uploadData.contentType === 'VIDEO' && uploadResult.duration) {
-          // Cloudinary returns duration in seconds, convert to minutes for storage
-          // Store as minutes (rounded to 1 decimal place for accuracy)
-          extractedDuration = Math.round((uploadResult.duration / 60) * 10) / 10;
-          logger.info('Video duration extracted from Cloudinary', {
-            durationSeconds: uploadResult.duration,
-            durationMinutes: extractedDuration,
-            publicId: uploadResult.public_id
+        // Extract duration from Cloudinary for videos (if not already extracted from file)
+        if (uploadData.contentType === 'VIDEO') {
+          if (uploadResult.duration) {
+            // Cloudinary returns duration in seconds, convert to minutes
+            const cloudinaryDuration = Math.round(uploadResult.duration / 60);
+            // Use Cloudinary duration if file extraction failed, otherwise use the more accurate file extraction
+            if (!extractedDuration) {
+              extractedDuration = cloudinaryDuration;
+              logger.info('Video duration extracted from Cloudinary', {
+                durationSeconds: uploadResult.duration,
+                durationMinutes: extractedDuration,
+                publicId: uploadResult.public_id
+              });
+            } else {
+              // Log both for comparison
+              logger.info('Video duration comparison', {
+                fileExtraction: extractedDuration,
+                cloudinaryExtraction: cloudinaryDuration,
+                using: extractedDuration
+              });
+            }
+          } else if (!extractedDuration) {
+            logger.error('No duration extracted from video file or Cloudinary - duration will be 0', {
+              filePath: uploadData.file.path,
+              publicId: uploadResult.public_id
+            });
+            // Set to 0 as last resort, but log error
+            extractedDuration = 0;
+          }
+        }
+        
+        // Validate extracted duration for videos
+        if (uploadData.contentType === 'VIDEO' && (!extractedDuration || extractedDuration === 0)) {
+          logger.error('Video duration is 0 or undefined - this should not happen', {
+            filePath: uploadData.file.path,
+            extractedDuration
           });
         }
 
@@ -249,6 +297,232 @@ export class ContentManagementService {
       createdAt: course.createdAt,
       updatedAt: course.updatedAt
     };
+  }
+
+  /**
+   * Upload bulk course content (multiple videos as lessons in a single course)
+   */
+  static async uploadBulkCourseContent(
+    title: string,
+    description: string,
+    level: CourseLevel,
+    category: CourseCategory,
+    subscriptionTier: SubscriptionTier,
+    availableLevels: CourseLevel[],
+    availableTiers: SubscriptionTier[],
+    files: Array<{ path: string; mimetype: string; originalname: string }>,
+    userId: string,
+    userRole: string,
+    tags?: string[]
+  ): Promise<{ content: ContentItem; lessons: number }> {
+    try {
+      // Validate user permissions
+      if (!['ADMIN', 'SENIOR_MANAGER', 'JUNIOR_MANAGER'].includes(userRole)) {
+        throw new ForbiddenError('Insufficient permissions to upload content');
+      }
+
+      // Validate junior manager restrictions
+      if (userRole === 'JUNIOR_MANAGER') {
+        if (!['A1', 'A2', 'B1'].includes(level)) {
+          throw new ForbiddenError('Junior managers can only create content for levels A1-B1');
+        }
+      }
+
+      if (files.length === 0) {
+        throw new ValidationError('At least one file is required');
+      }
+
+      if (files.length > 20) {
+        throw new ValidationError('Maximum 20 files allowed per course');
+      }
+
+      // Upload all files to Cloudinary and extract metadata
+      const lessonData: Array<{
+        title: string;
+        description: string;
+        content: string;
+        videoUrl?: string;
+        duration: number;
+        order: number;
+        thumbnailUrl?: string;
+      }> = [];
+
+      let totalDuration = 0;
+      let thumbnailUrl: string | undefined;
+
+      for (let i = 0; i < files.length; i++) {
+        const file = files[i];
+        
+        // Extract duration from video file BEFORE upload (more reliable)
+        let duration = 0;
+        try {
+          const durationInSeconds = await getVideoDuration(file.path);
+          // Convert seconds to minutes (rounded to nearest minute)
+          duration = Math.round(durationInSeconds / 60);
+          totalDuration += duration;
+          logger.info('Video duration extracted from file', {
+            filePath: file.path,
+            fileName: file.originalname,
+            durationSeconds: durationInSeconds,
+            durationMinutes: duration,
+            lessonNumber: i + 1
+          });
+        } catch (error) {
+          logger.warn('Failed to extract duration from video file, will try Cloudinary', {
+            filePath: file.path,
+            fileName: file.originalname,
+            error: error instanceof Error ? error.message : 'Unknown error'
+          });
+        }
+
+        const uploadResult = await CloudinaryService.uploadFile(file.path, {
+          folder: `tcf-tef-platform/content/video`,
+          resource_type: 'video',
+          tags: ['VIDEO', level, category as string, `lesson-${i + 1}`]
+        });
+
+        const fileUrl = uploadResult.secure_url;
+
+        // Use Cloudinary duration as fallback if file extraction failed
+        if (duration === 0 && uploadResult.duration) {
+          // Cloudinary returns duration in seconds, convert to minutes
+          duration = Math.round(uploadResult.duration / 60);
+          totalDuration += duration;
+          logger.info('Video duration extracted from Cloudinary (fallback)', {
+            fileName: file.originalname,
+            durationSeconds: uploadResult.duration,
+            durationMinutes: duration,
+            lessonNumber: i + 1
+          });
+        } else if (uploadResult.duration && duration > 0) {
+          // Log comparison if both are available
+          const cloudinaryDuration = Math.round(uploadResult.duration / 60);
+          logger.info('Video duration comparison', {
+            fileName: file.originalname,
+            fileExtraction: duration,
+            cloudinaryExtraction: cloudinaryDuration,
+            using: duration
+          });
+        }
+        
+        // Validate duration was extracted
+        if (duration === 0) {
+          logger.error('Video duration is 0 - extraction failed for both file and Cloudinary', {
+            fileName: file.originalname,
+            filePath: file.path
+          });
+        }
+
+        // Generate thumbnail for first video
+        if (i === 0) {
+          thumbnailUrl = CloudinaryService.getVideoThumbnailUrl(uploadResult.public_id);
+        }
+
+        // Extract lesson title from filename (remove extension)
+        const lessonTitle = file.originalname.replace(/\.[^/.]+$/, "") || `${title} - Leçon ${i + 1}`;
+
+        lessonData.push({
+          title: lessonTitle,
+          description: description || `Leçon ${i + 1} du cours ${title}`,
+          content: fileUrl,
+          videoUrl: fileUrl,
+          duration: Math.round(duration),
+          order: i + 1,
+          thumbnailUrl: i === 0 ? thumbnailUrl : undefined
+        });
+
+        // Clean up local file
+        try {
+          const fs = require('fs');
+          if (fs.existsSync(file.path)) {
+            await fs.promises.unlink(file.path);
+          }
+        } catch (unlinkError) {
+          logger.warn('Failed to delete local file after Cloudinary upload', {
+            filePath: file.path,
+            error: unlinkError
+          });
+        }
+      }
+
+      // Create ONE course with all lessons and restrictions
+      const course = await prisma.course.create({
+        data: {
+          title,
+          description,
+          level,
+          category,
+          requiredTier: subscriptionTier,
+          availableLevels: availableLevels.length > 0 ? availableLevels : [level],
+          availableSubscriptions: availableTiers.length > 0 ? availableTiers : [subscriptionTier],
+          duration: Math.round(totalDuration),
+          lessons: lessonData.length,
+          tags: tags || [],
+          thumbnail: thumbnailUrl,
+          isPublished: true,
+          createdById: userId,
+          lessons_data: {
+            create: lessonData.map(lesson => ({
+              title: lesson.title,
+              description: lesson.description,
+              content: lesson.content,
+              videoUrl: lesson.videoUrl,
+              duration: lesson.duration,
+              order: lesson.order,
+              resources: tags || []
+            }))
+          }
+        } as any, // Type assertion needed until migration is run
+        include: {
+          lessons_data: true,
+          createdBy: {
+            select: {
+              id: true,
+              firstName: true,
+              lastName: true,
+              role: true
+            }
+          }
+        }
+      });
+
+      logger.info(`Bulk course content uploaded successfully: ${course.id}`, {
+        courseId: course.id,
+        lessonsCount: lessonData.length,
+        totalDuration,
+        userId,
+        userRole
+      });
+
+      return {
+        content: {
+          id: course.id,
+          title: course.title,
+          description: course.description,
+          level: course.level,
+          category: course.category,
+          subscriptionTier: course.requiredTier,
+          contentType: 'VIDEO',
+          fileUrl: lessonData[0]?.content,
+          thumbnailUrl,
+          duration: Math.round(totalDuration),
+          tags: course.tags,
+          isPublished: course.isPublished,
+          createdBy: {
+            id: course.createdBy.id,
+            firstName: course.createdBy.firstName,
+            lastName: course.createdBy.lastName,
+            role: course.createdBy.role
+          },
+          createdAt: course.createdAt,
+          updatedAt: course.updatedAt
+        },
+        lessons: lessonData.length
+      };
+    } catch (error) {
+      logger.error('Error uploading bulk course content:', error);
+      throw error;
+    }
   }
 
   /**
@@ -473,22 +747,7 @@ export class ContentManagementService {
         isPublished: true
       };
 
-      // Filter by user's level and subscription access
-      // Note: Prisma schema only supports single level and tier, not arrays
-      if (level) {
-        where.level = level; // Direct level match
-      }
-
-      if (subscriptionTier) {
-        const tierHierarchy = ['FREE', 'ESSENTIAL', 'PREMIUM', 'PRO'];
-        const userTierIndex = tierHierarchy.indexOf(subscriptionTier);
-        const allowedTiers = tierHierarchy.slice(0, userTierIndex + 1);
-        
-        where.requiredTier = { in: allowedTiers }; // Direct tier access
-      } else {
-        where.requiredTier = 'FREE';
-      }
-
+      // Filter by category and search (level is just for display/filtering, not access control)
       if (category) where.category = category;
       if (search) {
         where.OR = [
@@ -498,7 +757,8 @@ export class ContentManagementService {
         ];
       }
 
-      const [courses, total] = await Promise.all([
+      // Get all courses first (we'll filter by subscription in code)
+      const [allCourses, total] = await Promise.all([
         prisma.course.findMany({
           where,
           include: {
@@ -512,30 +772,77 @@ export class ContentManagementService {
               }
             }
           },
-          orderBy: { createdAt: 'desc' },
-          skip: (page - 1) * limit,
-          take: limit
+          orderBy: { createdAt: 'desc' }
         }),
         prisma.course.count({ where })
       ]);
 
-      const content = courses.map(course => {
-        // Calculate real duration from lesson durations
-        const realDuration = course.lessons_data.reduce((total, lesson) => total + (lesson.duration || 0), 0);
+      // Filter by subscription tier (access control) - check if student's subscription is in availableSubscriptions
+      // Also deduplicate by title (keep only one course per title)
+      const courseMap = new Map<string, any>();
+      const studentSubscription = subscriptionTier || 'FREE';
+      
+      for (const course of allCourses) {
+        // Check access: student's subscription must be in course's availableSubscriptions
+        const availableSubs = (course as any).availableSubscriptions && (course as any).availableSubscriptions.length > 0
+          ? (course as any).availableSubscriptions
+          : [course.requiredTier];
+        
+        const hasAccess = availableSubs.includes(studentSubscription);
+        
+        if (!hasAccess) continue; // Skip courses student can't access
+        
+        // Deduplicate by title - normalize title (trim, lowercase) to catch all duplicates
+        const normalizedTitle = course.title.trim().toLowerCase();
+        
+        // Keep only the first course with this title (prefer one with more lessons or more recent)
+        if (!courseMap.has(normalizedTitle)) {
+          courseMap.set(normalizedTitle, course);
+        } else {
+          // If duplicate found, keep the one with more lessons or more recent
+          const existing = courseMap.get(normalizedTitle);
+          const existingLessons = existing?.lessons_data?.length || 0;
+          const currentLessons = course.lessons_data?.length || 0;
+          
+          // Prefer course with more lessons, or if equal, keep the more recent one
+          if (currentLessons > existingLessons || 
+              (currentLessons === existingLessons && course.createdAt > existing.createdAt)) {
+            courseMap.set(normalizedTitle, course);
+          }
+        }
+      }
+
+      const uniqueCourses = Array.from(courseMap.values());
+      
+      // Apply pagination after deduplication
+      const paginatedCourses = uniqueCourses.slice((page - 1) * limit, page * limit);
+
+      const content = paginatedCourses.map(course => {
+        // ALWAYS calculate real duration from lesson durations - NEVER use stored course.duration
+        // Sum all lesson durations to get actual course duration
+        const realDuration = course.lessons_data && course.lessons_data.length > 0
+          ? course.lessons_data.reduce((total, lesson) => {
+              const lessonDuration = lesson.duration || 0
+              return total + lessonDuration
+            }, 0)
+          : 0; // If no lessons, duration is 0
+        
+        // Get available levels (for display)
+        const availableLevels = (course as any).availableLevels && (course as any).availableLevels.length > 0
+          ? (course as any).availableLevels
+          : [course.level];
         
         return {
           id: course.id,
           title: course.title,
           description: course.description,
-          level: course.level,
+          level: availableLevels[0], // Use first level for display
           category: course.category,
           subscriptionTier: course.requiredTier,
-          // Note: availableLevels and availableTiers don't exist in Prisma schema
-          // These would need to be implemented via junction tables if needed
           contentType: course.lessons_data.length > 0 && course.lessons_data[0].videoUrl ? 'VIDEO' : 'NOTE',
           fileUrl: course.lessons_data.length > 0 ? course.lessons_data[0].content : undefined,
           thumbnailUrl: course.thumbnail,
-          duration: realDuration, // Use calculated duration instead of stored duration
+          duration: realDuration, // Use calculated duration from lessons_data only
           tags: course.tags,
           isPublished: course.isPublished,
           createdBy: course.createdBy,
@@ -555,8 +862,8 @@ export class ContentManagementService {
 
       return {
         content,
-        total,
-        pages: Math.ceil(total / limit)
+        total: uniqueCourses.length, // Use deduplicated count
+        pages: Math.ceil(uniqueCourses.length / limit)
       };
     } catch (error) {
       logger.error('Error fetching course content:', error);
@@ -674,8 +981,8 @@ export class ContentManagementService {
         where.level = { in: ['A1', 'A2', 'B1'] };
       }
 
-      // Get both courses and tests
-      const [courses, tests] = await Promise.all([
+      // Get all courses first (we'll deduplicate in code)
+      const [allCourses, tests] = await Promise.all([
         prisma.course.findMany({
           where,
           include: {
@@ -689,9 +996,7 @@ export class ContentManagementService {
               }
             }
           },
-          orderBy: { createdAt: 'desc' },
-          skip: (page - 1) * limit,
-          take: limit
+          orderBy: { createdAt: 'desc' }
         }),
         prisma.test.findMany({
           where,
@@ -711,42 +1016,128 @@ export class ContentManagementService {
         })
       ]);
 
-      // Group courses by title to create unified entries
+      // Deduplicate courses by title and aggregate all levels/subscriptions
       const courseGroups = new Map<string, any[]>();
       
-      courses.forEach(course => {
-        const key = course.title;
-        if (!courseGroups.has(key)) {
-          courseGroups.set(key, []);
+      // Group all courses by normalized title
+      for (const course of allCourses) {
+        const normalizedTitle = course.title.trim().toLowerCase();
+        
+        if (!courseGroups.has(normalizedTitle)) {
+          courseGroups.set(normalizedTitle, []);
         }
-        courseGroups.get(key)!.push(course);
-      });
+        courseGroups.get(normalizedTitle)!.push(course);
+      }
 
-      const courseContent = Array.from(courseGroups.entries()).map(([title, courseGroup]) => {
-        const primaryCourse = courseGroup[0]; // Use first course as primary
-        const allLevels = [...new Set(courseGroup.map(c => c.level))];
-        const allSubscriptions = [...new Set(courseGroup.map(c => c.requiredTier))];
+      // For each group, create a single unified course with aggregated data
+      const unifiedCourses = Array.from(courseGroups.entries()).map(([normalizedTitle, courseGroup]) => {
+        // Find the primary course (one with most lessons, or most recent)
+        const primaryCourse = courseGroup.reduce((best, current) => {
+          const bestLessons = best.lessons_data?.length || 0;
+          const currentLessons = current.lessons_data?.length || 0;
+          
+          if (currentLessons > bestLessons) return current;
+          if (currentLessons === bestLessons && current.createdAt > best.createdAt) return current;
+          return best;
+        });
+
+        // Aggregate all levels from all courses in the group
+        const allLevelsSet = new Set<CourseLevel>();
+        courseGroup.forEach(c => {
+          // Check if course has availableLevels array (new system)
+          if ((c as any).availableLevels && Array.isArray((c as any).availableLevels) && (c as any).availableLevels.length > 0) {
+            (c as any).availableLevels.forEach((level: CourseLevel) => allLevelsSet.add(level));
+          } else {
+            // Old system: use single level field
+            allLevelsSet.add(c.level);
+          }
+        });
+        const aggregatedLevels = Array.from(allLevelsSet);
+
+        // Aggregate all subscriptions from all courses in the group
+        const allSubscriptionsSet = new Set<SubscriptionTier>();
+        courseGroup.forEach(c => {
+          // Check if course has availableSubscriptions array (new system)
+          if ((c as any).availableSubscriptions && Array.isArray((c as any).availableSubscriptions) && (c as any).availableSubscriptions.length > 0) {
+            (c as any).availableSubscriptions.forEach((tier: SubscriptionTier) => allSubscriptionsSet.add(tier));
+          } else {
+            // Old system: use single requiredTier field
+            allSubscriptionsSet.add(c.requiredTier);
+          }
+        });
+        const aggregatedSubscriptions = Array.from(allSubscriptionsSet);
+
+        // Use primary course's lessons_data (they should all be the same anyway)
+        return {
+          ...primaryCourse,
+          // Override with aggregated data
+          level: aggregatedLevels[0] || primaryCourse.level, // Keep first level as primary for display
+          requiredTier: aggregatedSubscriptions[0] || primaryCourse.requiredTier, // Keep first tier as primary
+          availableLevels: aggregatedLevels, // Store all levels
+          availableSubscriptions: aggregatedSubscriptions, // Store all subscriptions
+        };
+      });
+      
+      // Apply pagination after deduplication
+      const paginatedCourses = unifiedCourses.slice((page - 1) * limit, page * limit);
+
+      // Process courses (now deduplicated - one course per title with aggregated data)
+      const courseContent = paginatedCourses.map(course => {
+        // ALWAYS calculate real duration from lessons_data - NEVER use stored course.duration
+        // Sum all lesson durations to get actual course duration
+        const realDuration = course.lessons_data && course.lessons_data.length > 0
+          ? course.lessons_data.reduce((total, lesson) => {
+              const lessonDuration = lesson.duration || 0
+              return total + lessonDuration
+            }, 0)
+          : 0; // If no lessons, duration is 0
+        
+        // Count total number of video lessons
+        const videoLessons = course.lessons_data.filter(lesson => lesson.videoUrl);
+        const totalVideoCount = videoLessons.length;
+        
+        // Get available levels and subscriptions (use aggregated arrays from deduplication)
+        const allLevels = (course as any).availableLevels && Array.isArray((course as any).availableLevels) && (course as any).availableLevels.length > 0 
+          ? (course as any).availableLevels 
+          : [course.level];
+        const allSubscriptions = (course as any).availableSubscriptions && Array.isArray((course as any).availableSubscriptions) && (course as any).availableSubscriptions.length > 0
+          ? (course as any).availableSubscriptions
+          : [course.requiredTier];
+        
+        // Map subscription tiers to French names for frontend
+        const mapTierToFrench = (tier: string): string => {
+          const tierMap: Record<string, string> = {
+            'FREE': 'Gratuit',
+            'ESSENTIAL': 'Essentiel',
+            'PREMIUM': 'Premium',
+            'PRO': 'Pro+'
+          };
+          return tierMap[tier] || tier;
+        };
+        
+        const subscriptionsFrench = allSubscriptions.map(mapTierToFrench);
         
         return {
-          id: primaryCourse.id,
-          title: primaryCourse.title,
-          description: primaryCourse.description,
+          id: course.id,
+          title: course.title,
+          description: course.description,
           level: allLevels, // Return array of levels
-          category: primaryCourse.category,
+          category: course.category,
           subscriptionTier: allSubscriptions, // Return array of subscriptions
-          contentType: primaryCourse.lessons_data.length > 0 && primaryCourse.lessons_data[0].videoUrl ? 'VIDEO' : 'NOTE',
-          fileUrl: primaryCourse.lessons_data.length > 0 ? primaryCourse.lessons_data[0].content : undefined,
-          thumbnailUrl: primaryCourse.thumbnail,
-          duration: primaryCourse.duration,
-          tags: primaryCourse.tags,
-          isPublished: primaryCourse.isPublished,
-          createdBy: primaryCourse.createdBy,
-          createdAt: primaryCourse.createdAt,
-          updatedAt: primaryCourse.updatedAt,
+          contentType: course.lessons_data.length > 0 && course.lessons_data[0].videoUrl ? 'VIDEO' : 'NOTE',
+          fileUrl: course.lessons_data.length > 0 ? course.lessons_data[0].content : undefined,
+          thumbnailUrl: course.thumbnail,
+          duration: realDuration, // Use calculated real duration
+          totalVideoCount, // Real video count
+          tags: course.tags,
+          isPublished: course.isPublished,
+          createdBy: course.createdBy,
+          createdAt: course.createdAt,
+          updatedAt: course.updatedAt,
           // Add unified fields
           levels: allLevels,
-          subscriptions: allSubscriptions,
-          totalVariants: courseGroup.length
+          subscriptions: subscriptionsFrench, // Return French names for frontend
+          lessons_data: course.lessons_data
         };
       });
 
@@ -777,8 +1168,8 @@ export class ContentManagementService {
 
       return {
         content: filteredContent,
-        total: filteredContent.length,
-        pages: Math.ceil(filteredContent.length / limit)
+        total: unifiedCourses.length, // Use deduplicated count
+        pages: Math.ceil(unifiedCourses.length / limit)
       };
     } catch (error) {
       logger.error('Error fetching management content:', error);
@@ -822,22 +1213,6 @@ export class ContentManagementService {
         throw new ForbiddenError('You can only update your own courses');
       }
 
-      // Get all courses with the same title
-      const allCourses = await prisma.course.findMany({
-        where: { title: primaryCourse.title },
-        include: {
-          lessons_data: true,
-          createdBy: {
-            select: {
-              id: true,
-              firstName: true,
-              lastName: true,
-              role: true
-            }
-          }
-        }
-      });
-
       // Validate inputs
       if (!levels || levels.length === 0) {
         throw new ValidationError('At least one level must be provided');
@@ -846,24 +1221,34 @@ export class ContentManagementService {
         throw new ValidationError('At least one subscription tier must be provided');
       }
 
-      // Handle "all" selections - if all levels/subscriptions are selected, use the first one
-      // Since Prisma schema only supports single level/tier, we'll use the first selected
-      const selectedLevel = levels.includes('ALL') || levels.length === 6 
-        ? 'A1' // Default to A1 if all selected
-        : (levels[0] as CourseLevel);
-      
-      const selectedTier = subscriptions.includes('ALL') || subscriptions.length === 4
-        ? 'FREE' // Default to FREE if all selected
-        : (subscriptions[0] as SubscriptionTier);
+      // Map French subscription names to backend tier values
+      const mapFrenchToTier = (frenchName: string): SubscriptionTier => {
+        const tierMap: Record<string, SubscriptionTier> = {
+          'Gratuit': 'FREE',
+          'Essentiel': 'ESSENTIAL',
+          'Premium': 'PREMIUM',
+          'Pro+': 'PRO'
+        };
+        return tierMap[frenchName] || frenchName as SubscriptionTier;
+      };
 
-      // ✅ FIXED: Update the SINGLE course with selected level and tier
+      const backendSubscriptions = subscriptions.map(mapFrenchToTier);
+      const backendLevels = levels.map(level => level as CourseLevel);
+
+      // Calculate real duration from lessons
+      const realDuration = primaryCourse.lessons_data.reduce((total, lesson) => total + (lesson.duration || 0), 0);
+      const videoLessons = primaryCourse.lessons_data.filter(lesson => lesson.videoUrl);
+      const totalVideoCount = videoLessons.length;
+
+      // Update the SINGLE course with new restrictions
       const updatedCourse = await prisma.course.update({
-        where: { id: courseId },
+        where: { id: primaryCourse.id },
         data: {
-          level: selectedLevel,
-          requiredTier: selectedTier,
-          // Note: Multiple levels/tiers would require junction tables in Prisma schema
-        },
+          availableLevels: backendLevels,
+          availableSubscriptions: backendSubscriptions,
+          level: backendLevels[0], // Keep first level as primary for display
+          requiredTier: backendSubscriptions[0], // Keep first tier as primary
+        } as any, // Type assertion needed until migration is run
         include: {
           lessons_data: true,
           createdBy: {
@@ -877,25 +1262,45 @@ export class ContentManagementService {
         }
       });
 
-        return {
-          id: updatedCourse.id,
-          title: updatedCourse.title,
-          description: updatedCourse.description,
-          level: updatedCourse.level,
-          category: updatedCourse.category,
-          subscriptionTier: updatedCourse.requiredTier, // Map requiredTier to subscriptionTier
-          requiredTier: updatedCourse.requiredTier,
-          // Note: availableLevels and availableTiers don't exist in Prisma schema
-          contentType: updatedCourse.lessons_data.length > 0 && updatedCourse.lessons_data[0].videoUrl ? 'VIDEO' : 'NOTE',
-          fileUrl: updatedCourse.lessons_data.length > 0 ? updatedCourse.lessons_data[0].content : undefined,
-          thumbnailUrl: updatedCourse.thumbnail,
-          duration: updatedCourse.duration,
-          tags: updatedCourse.tags,
-          isPublished: updatedCourse.isPublished,
-          createdBy: updatedCourse.createdBy,
-          createdAt: updatedCourse.createdAt,
-          updatedAt: updatedCourse.updatedAt
+      // Map subscription tiers to French names for frontend
+      const mapTierToFrench = (tier: string): string => {
+        const tierMap: Record<string, string> = {
+          'FREE': 'Gratuit',
+          'ESSENTIAL': 'Essentiel',
+          'PREMIUM': 'Premium',
+          'PRO': 'Pro+'
         };
+        return tierMap[tier] || tier;
+      };
+
+      const subscriptionsFrench = backendSubscriptions.map(mapTierToFrench);
+
+      return {
+        id: updatedCourse.id,
+        title: updatedCourse.title,
+        description: updatedCourse.description,
+        level: backendLevels,
+        category: updatedCourse.category,
+        subscriptionTier: backendSubscriptions as SubscriptionTier[],
+        contentType: updatedCourse.lessons_data.length > 0 && updatedCourse.lessons_data[0].videoUrl ? 'VIDEO' : 'NOTE',
+        fileUrl: updatedCourse.lessons_data.length > 0 ? updatedCourse.lessons_data[0].content : undefined,
+        thumbnailUrl: updatedCourse.thumbnail,
+        duration: realDuration,
+        totalVideoCount,
+        tags: updatedCourse.tags,
+        isPublished: updatedCourse.isPublished,
+        createdBy: {
+          id: updatedCourse.createdBy.id,
+          firstName: updatedCourse.createdBy.firstName,
+          lastName: updatedCourse.createdBy.lastName,
+          role: updatedCourse.createdBy.role
+        },
+        createdAt: updatedCourse.createdAt,
+        updatedAt: updatedCourse.updatedAt,
+        levels: backendLevels,
+        subscriptions: subscriptionsFrench as SubscriptionTier[],
+        lessons_data: updatedCourse.lessons_data
+      };
     } catch (error) {
       logger.error('Error updating course levels and subscriptions:', error);
       throw error;

@@ -77,7 +77,9 @@ export class LiveSessionService {
             select: {
               id: true,
               firstName: true,
-              lastName: true
+              lastName: true,
+              email: true,
+              profileImage: true
             }
           },
           participants: true
@@ -113,7 +115,9 @@ export class LiveSessionService {
               id: true,
               firstName: true,
               lastName: true,
-              role: true
+              role: true,
+              email: true,
+              profileImage: true
             }
           },
           participants: {
@@ -238,7 +242,9 @@ export class LiveSessionService {
             select: {
               id: true,
               firstName: true,
-              lastName: true
+              lastName: true,
+              email: true,
+              profileImage: true
             }
           },
           participants: userId ? {
@@ -470,7 +476,9 @@ export class LiveSessionService {
             select: {
               id: true,
               firstName: true,
-              lastName: true
+              lastName: true,
+              email: true,
+              profileImage: true
             }
           },
           participants: {
@@ -479,13 +487,73 @@ export class LiveSessionService {
                 select: {
                   id: true,
                   firstName: true,
-                  lastName: true
+                  lastName: true,
+                  email: true
+                }
+              }
+            }
+          },
+          reminders: {
+            where: {
+              emailSent: false,
+              reminderType: 'status_change'
+            },
+            include: {
+              user: {
+                select: {
+                  id: true,
+                  firstName: true,
+                  lastName: true,
+                  email: true
                 }
               }
             }
           }
         }
       });
+
+      // If status changed from SCHEDULED to LIVE, send reminder emails to all participants with reminders
+      if (existingSession.status === 'SCHEDULED' && newStatus === 'LIVE') {
+        console.log('📧 Status changed to LIVE - sending reminder emails to participants...');
+        const { EmailService } = await import('./emailService');
+        
+        const sessionDate = new Date(updatedSession.date);
+        const sessionEnd = new Date(sessionDate.getTime() + (updatedSession.duration * 60 * 1000));
+        
+        // Send reminder emails to all participants
+        for (const participant of updatedSession.participants) {
+          try {
+            const emailData = {
+              firstName: participant.user.firstName || 'Étudiant',
+              email: participant.user.email,
+              sessionTitle: updatedSession.title,
+              sessionDate: sessionDate.toLocaleDateString('fr-FR', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' }),
+              sessionTime: sessionDate.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' }),
+              joinUrl: `${process.env.FRONTEND_URL || 'http://localhost:3000'}/live`,
+              duration: updatedSession.duration || 60,
+              reminderMinutes: 5 // Status change happens 5 minutes before
+            };
+
+            await EmailService.sendLiveSessionReminderEmail(emailData);
+            console.log(`✅ Reminder email sent to ${participant.user.email}`);
+          } catch (error: any) {
+            console.error(`❌ Failed to send reminder email to ${participant.user.email}:`, error);
+          }
+        }
+
+        // Mark status_change reminders as sent
+        await prisma.sessionReminder.updateMany({
+          where: {
+            sessionId,
+            reminderType: 'status_change',
+            emailSent: false
+          },
+          data: {
+            emailSent: true,
+            sentAt: new Date()
+          }
+        });
+      }
 
       console.log('✅ Session status updated successfully in database:', {
         sessionId,
@@ -503,10 +571,10 @@ export class LiveSessionService {
 
       return {
         ...updatedSession,
-        participantCount: updatedSession.participants.length,
+        participantCount: updatedSession.participants?.length || 0,
         isRegistered: false,
         isFavorited: false
-      };
+      } as LiveSessionWithDetails;
     } catch (error) {
       logger.error('Failed to update session status', { sessionId, newStatus, userId, error });
       throw error;
@@ -569,6 +637,7 @@ export class LiveSessionService {
       // Transform to LiveSessionWithDetails
       const sessions: LiveSessionWithDetails[] = participants.map(participant => ({
         ...participant.liveSession,
+        createdBy: participant.liveSession.createdBy,
         participantCount: participant.liveSession._count.participants,
         isRegistered: true,
         isFavorited: false
@@ -607,7 +676,9 @@ export class LiveSessionService {
             select: {
               id: true,
               firstName: true,
-              lastName: true
+              lastName: true,
+              email: true,
+              profileImage: true
             }
           },
           _count: {

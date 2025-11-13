@@ -61,6 +61,7 @@ import moderationRoutes from './routes/moderation';
 import { chatRoomService } from './services/chatRoomService';
 import { RealTimeMessagingService } from './services/realTimeMessagingService';
 import { MessageQueueWorker } from './workers/messageQueueWorker';
+import { ReminderSchedulerService } from './services/reminderSchedulerService';
 import { monitoringService } from './services/monitoringService';
 import { checkRedisHealth } from './config/redis';
 import { checkDatabaseHealth } from './config/database';
@@ -246,6 +247,9 @@ const realTimeMessagingService = new RealTimeMessagingService(server);
 // Initialize message queue worker
 const messageQueueWorker = new MessageQueueWorker();
 
+// Reminder scheduler interval (will be set when server starts)
+let reminderSchedulerInterval: NodeJS.Timeout | null = null;
+
 // Start monitoring service
 monitoringService.start();
 
@@ -278,6 +282,15 @@ server.listen(PORT, async () => {
   } catch (error) {
     console.error(`❌ Failed to start message queue worker:`, error);
   }
+
+  // Start reminder scheduler
+  try {
+    reminderSchedulerInterval = ReminderSchedulerService.startScheduler();
+    console.log(`🕐 Reminder scheduler started`);
+    logger.info(`🕐 Reminder scheduler started`);
+  } catch (error) {
+    console.error(`❌ Failed to start reminder scheduler:`, error);
+  }
   
   logger.info(`🚀 Server running on port ${PORT}`);
   logger.info(`📊 Environment: ${config.nodeEnv}`);
@@ -298,17 +311,9 @@ process.on('SIGTERM', async () => {
     await messageQueueWorker.stop();
   }
   
-  monitoringService.stop();
-  
-  process.exit(0);
-});
-
-process.on('SIGINT', async () => {
-  logger.info('SIGINT received, shutting down gracefully');
-  
-  // Stop services
-  if (messageQueueWorker) {
-    await messageQueueWorker.stop();
+  // Stop reminder scheduler
+  if (reminderSchedulerInterval) {
+    ReminderSchedulerService.stopScheduler(reminderSchedulerInterval);
   }
   
   monitoringService.stop();
@@ -322,6 +327,11 @@ process.on('SIGINT', async () => {
   // Stop services
   if (messageQueueWorker) {
     await messageQueueWorker.stop();
+  }
+  
+  // Stop reminder scheduler
+  if (reminderSchedulerInterval) {
+    ReminderSchedulerService.stopScheduler(reminderSchedulerInterval);
   }
   
   monitoringService.stop();

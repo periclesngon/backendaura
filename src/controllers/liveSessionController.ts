@@ -366,32 +366,79 @@ export class LiveSessionController {
       const reminderMinutes = reminderTime === '5min' ? 5 : 10;
       const reminderDate = new Date(sessionDate.getTime() - (reminderMinutes * 60 * 1000));
 
-      // Store reminder in database
-      // TODO: sessionReminder model does not exist in schema
-      // await prisma.sessionReminder.create({
-      //   data: {
-      //     userId,
-      //     sessionId,
-      //     reminderTime: reminderMinutes,
-      //     reminderDate,
-      //     emailSent: false
-      //   }
-      // });
+      // Check if reminder already exists
+      const existingReminder = await prisma.sessionReminder.findFirst({
+        where: {
+          userId,
+          sessionId,
+          reminderTime: reminderMinutes,
+          reminderType: 'scheduled'
+        }
+      });
 
-      // Schedule email reminder (in a real implementation, you'd use a job queue)
-      // For now, we'll send a confirmation email
+      let reminder;
+      if (existingReminder) {
+        // Update existing reminder
+        reminder = await prisma.sessionReminder.update({
+          where: { id: existingReminder.id },
+          data: {
+            reminderDate,
+            emailSent: false,
+            sentAt: null
+          }
+        });
+      } else {
+        // Create new reminder
+        reminder = await prisma.sessionReminder.create({
+          data: {
+            userId,
+            sessionId,
+            reminderTime: reminderMinutes,
+            reminderDate,
+            emailSent: false,
+            reminderType: 'scheduled'
+          }
+        });
+      }
+
+      // Also create a status_change reminder (for when session goes LIVE 5 minutes before)
+      // This will be sent when status changes from SCHEDULED to LIVE
+      const statusChangeReminderDate = new Date(sessionDate.getTime() - (5 * 60 * 1000)); // 5 minutes before
+      const existingStatusReminder = await prisma.sessionReminder.findFirst({
+        where: {
+          userId,
+          sessionId,
+          reminderType: 'status_change'
+        }
+      });
+
+      if (!existingStatusReminder) {
+        await prisma.sessionReminder.create({
+          data: {
+            userId,
+            sessionId,
+            reminderTime: 5, // 5 minutes before
+            reminderDate: statusChangeReminderDate,
+            emailSent: false,
+            reminderType: 'status_change'
+          }
+        });
+      }
+
+      // Send confirmation email immediately
       const emailData = {
         firstName: user.firstName,
         email: user.email,
         sessionTitle: session.title,
-        sessionDate: sessionDate.toLocaleDateString('fr-FR'),
+        sessionDate: sessionDate.toLocaleDateString('fr-FR', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' }),
         sessionTime: sessionDate.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' }),
-        joinUrl: `${process.env.FRONTEND_URL}/live/${sessionId}`,
-        duration: session.duration || 60
+        joinUrl: `${process.env.FRONTEND_URL || 'http://localhost:3000'}/live`,
+        duration: session.duration || 60,
+        reminderMinutes: reminderMinutes
       };
 
       // Send confirmation email
-      await EmailService.sendLiveSessionReminderEmail(emailData);
+      await EmailService.sendLiveSessionReminderConfirmationEmail(emailData);
 
       logger.info('Reminder set for live session', {
         sessionId,
