@@ -265,28 +265,135 @@ export class CourseService {
 
       // Get user's subscription tier for access control
       let userSubscriptionTier: SubscriptionTier = SubscriptionTier.FREE;
+      logger.info('🔍 Getting user subscription tier', { userId, hasUserId: !!userId });
+      
       if (userId) {
         const user = await prisma.user.findUnique({
           where: { id: userId },
-          select: { subscriptionTier: true }
+          select: { subscriptionTier: true, email: true }
         });
-        if (user?.subscriptionTier) {
-          userSubscriptionTier = user.subscriptionTier;
+        
+        if (user) {
+          if (user.subscriptionTier) {
+            userSubscriptionTier = user.subscriptionTier;
+            logger.info('✅ User subscription tier fetched', { 
+              userId, 
+              email: user.email,
+              subscriptionTier: userSubscriptionTier 
+            });
+          } else {
+            logger.warn('⚠️ User found but no subscription tier', { userId, email: user.email });
+          }
+        } else {
+          logger.warn('⚠️ User not found in database', { userId });
         }
+      } else {
+        logger.warn('⚠️ No userId provided, defaulting to FREE tier - THIS IS THE PROBLEM!');
       }
 
-      // Filter by subscription tier (access control) and deduplicate by title
+      // Process all courses (don't filter out - show all with access flags)
+      // Deduplicate by title and check subscription access
       const courseMap = new Map<string, any>();
       
       for (const course of allCourses) {
-        // Check access: student's subscription must be in course's availableSubscriptions
-        const availableSubs = (course as any).availableSubscriptions && (course as any).availableSubscriptions.length > 0
-          ? (course as any).availableSubscriptions
-          : [course.requiredTier];
+        // Parse availableSubscriptions from JSON field
+        let availableSubs: SubscriptionTier[] = [];
+        const subsField = (course as any).availableSubscriptions;
         
-        const hasAccess = availableSubs.includes(userSubscriptionTier);
+        // Handle null, undefined, or empty values
+        if (subsField != null && subsField !== 'null' && subsField !== '') {
+          try {
+            // Handle JSON field - could be string, array, or already parsed
+            if (typeof subsField === 'string') {
+              // Check if it's a JSON string
+              if (subsField.trim().startsWith('[') || subsField.trim().startsWith('{')) {
+                availableSubs = JSON.parse(subsField);
+              } else {
+                // Single value as string
+                availableSubs = [subsField as SubscriptionTier];
+              }
+            } else if (Array.isArray(subsField)) {
+              availableSubs = subsField;
+            } else if (typeof subsField === 'object') {
+              // Handle Prisma JsonNull or other object types
+              availableSubs = [];
+            }
+          } catch (e) {
+            // If parsing fails, fall back to requiredTier
+            availableSubs = [];
+          }
+        }
         
-        if (!hasAccess) continue; // Skip courses user can't access
+        // If no availableSubscriptions, use requiredTier (this handles null/undefined cases)
+        if (availableSubs.length === 0) {
+          availableSubs = [course.requiredTier];
+        }
+        
+        // IMPORTANT: If course is FREE (requiredTier = FREE or FREE is in availableSubscriptions), everyone has access
+        const isFreeCourse = course.requiredTier === SubscriptionTier.FREE || availableSubs.includes(SubscriptionTier.FREE);
+        
+        let hasAccess = false;
+        let requiredTierForAccess: SubscriptionTier = course.requiredTier;
+        
+        if (isFreeCourse) {
+          // FREE courses are accessible to everyone - no restrictions
+          hasAccess = true;
+          requiredTierForAccess = SubscriptionTier.FREE;
+          logger.debug('FREE course - granting access', { courseId: course.id, title: course.title });
+        } else {
+          // For paid courses, check access using hierarchy: user can access if their tier >= any required tier
+          // PRO can access all, PREMIUM can access PREMIUM/ESSENTIAL, etc.
+          logger.debug('Checking paid course access', {
+            courseId: course.id,
+            title: course.title,
+            userSubscriptionTier,
+            availableSubs,
+            requiredTier: course.requiredTier
+          });
+          
+          for (const tier of availableSubs) {
+            const canAccess = this.hasAccessToTier(userSubscriptionTier, tier);
+            logger.debug('Access check', {
+              userTier: userSubscriptionTier,
+              courseTier: tier,
+              canAccess,
+              courseTitle: course.title
+            });
+            
+            if (canAccess) {
+              hasAccess = true;
+              requiredTierForAccess = tier;
+              break;
+            }
+          }
+          
+          // If user doesn't have access to any tier, find the minimum required tier
+          if (!hasAccess) {
+            // Find the lowest tier in availableSubs that user needs
+            const tierHierarchy = {
+              [SubscriptionTier.FREE]: 0,
+              [SubscriptionTier.ESSENTIAL]: 1,
+              [SubscriptionTier.PREMIUM]: 2,
+              [SubscriptionTier.PRO]: 3
+            };
+            
+            const userTierLevel = tierHierarchy[userSubscriptionTier];
+            const requiredTiers = availableSubs.map(t => ({
+              tier: t,
+              level: tierHierarchy[t]
+            })).filter(t => t.level > userTierLevel);
+            
+            if (requiredTiers.length > 0) {
+              requiredTierForAccess = requiredTiers.sort((a, b) => a.level - b.level)[0].tier;
+            } else {
+              requiredTierForAccess = availableSubs[0] || course.requiredTier;
+            }
+          }
+        }
+        
+        // Add access information to course
+        (course as any).hasAccess = hasAccess;
+        (course as any).requiredTierForAccess = requiredTierForAccess;
         
         // Deduplicate by title - normalize title (trim, lowercase) to catch all duplicates
         const normalizedTitle = course.title.trim().toLowerCase();
@@ -326,16 +433,54 @@ export class CourseService {
             }, 0)
           : 0; // If no lessons, duration is 0
         
+        // Parse availableLevels from JSON if needed
+        let availableLevels: CourseLevel[] = [];
+        if ((course as any).availableLevels) {
+          try {
+            const levels = (course as any).availableLevels;
+            if (typeof levels === 'string') {
+              availableLevels = JSON.parse(levels);
+            } else if (Array.isArray(levels)) {
+              availableLevels = levels;
+            }
+          } catch (e) {
+            availableLevels = [course.level];
+          }
+        }
+        if (availableLevels.length === 0) {
+          availableLevels = [course.level];
+        }
+        
+        // Parse availableSubscriptions from JSON if needed
+        let availableSubscriptions: SubscriptionTier[] = [];
+        if ((course as any).availableSubscriptions) {
+          try {
+            const subs = (course as any).availableSubscriptions;
+            if (typeof subs === 'string') {
+              availableSubscriptions = JSON.parse(subs);
+            } else if (Array.isArray(subs)) {
+              availableSubscriptions = subs;
+            }
+          } catch (e) {
+            availableSubscriptions = [course.requiredTier];
+          }
+        }
+        if (availableSubscriptions.length === 0) {
+          availableSubscriptions = [course.requiredTier];
+        }
+        
         return {
           ...course,
           duration: realDuration, // Use calculated duration in minutes (from lessons_data only)
           lessons_data: course.lessons_data, // Explicitly include lessons_data
-          availableLevels: (course as any).availableLevels || [course.level], // Include availableLevels for filtering
-          availableSubscriptions: (course as any).availableSubscriptions || [course.requiredTier], // Include availableSubscriptions
+          availableLevels: availableLevels, // Include availableLevels for filtering
+          availableSubscriptions: availableSubscriptions, // Include availableSubscriptions
           thumbnail: course.thumbnail, // Include thumbnail for video thumbnails
           userProgress: course.progress?.[0],
           isFavorited: false, // Will be calculated separately if needed
           isEnrolled: course.enrollments.length > 0,
+          hasAccess: (course as any).hasAccess ?? true, // Access flag for frontend
+          requiredTierForAccess: (course as any).requiredTierForAccess ?? course.requiredTier, // Minimum tier needed
           progress: course.progress?.[0] ? {
             completedLessons: 0, // This would need to be calculated based on actual progress
             totalLessons: course._count.lessons_data,

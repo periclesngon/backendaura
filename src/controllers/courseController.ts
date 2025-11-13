@@ -57,7 +57,8 @@ export class CourseController {
    * Get all courses with pagination and filtering
    */
   static getAllCourses = asyncHandler(async (req: Request, res: Response): Promise<void> => {
-    const userId = req.user?.userId;
+    // Use userId or id (for compatibility)
+    const userId = req.user?.userId || req.user?.id;
     const userRole = req.user?.role;
 
     const pagination: PaginationParams = {

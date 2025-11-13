@@ -1240,15 +1240,26 @@ export class ContentManagementService {
       const videoLessons = primaryCourse.lessons_data.filter(lesson => lesson.videoUrl);
       const totalVideoCount = videoLessons.length;
 
+      // Determine requiredTier: if FREE is in subscriptions, use FREE, otherwise use the lowest paid tier
+      const hasFree = backendSubscriptions.includes('FREE');
+      const tierHierarchy = { 'FREE': 0, 'ESSENTIAL': 1, 'PREMIUM': 2, 'PRO': 3 };
+      const sortedSubscriptions = [...backendSubscriptions].sort((a, b) => {
+        const aLevel = tierHierarchy[a as keyof typeof tierHierarchy] ?? 999;
+        const bLevel = tierHierarchy[b as keyof typeof tierHierarchy] ?? 999;
+        return aLevel - bLevel;
+      });
+      const requiredTier = hasFree ? 'FREE' : sortedSubscriptions[0];
+
       // Update the SINGLE course with new restrictions
+      // Prisma Json fields need to be passed as arrays (they're automatically serialized)
       const updatedCourse = await prisma.course.update({
         where: { id: primaryCourse.id },
         data: {
-          availableLevels: backendLevels,
-          availableSubscriptions: backendSubscriptions,
+          availableLevels: backendLevels as any, // Prisma will serialize this to JSON
+          availableSubscriptions: backendSubscriptions as any, // Prisma will serialize this to JSON
           level: backendLevels[0], // Keep first level as primary for display
-          requiredTier: backendSubscriptions[0], // Keep first tier as primary
-        } as any, // Type assertion needed until migration is run
+          requiredTier: requiredTier as SubscriptionTier, // Use FREE if available, otherwise lowest tier
+        },
         include: {
           lessons_data: true,
           createdBy: {
