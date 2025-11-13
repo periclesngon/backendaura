@@ -177,31 +177,33 @@ model SubscriptionPlan {
 }
 
 model Course {
-  id            String             @id @default(cuid())
-  title         String
-  titleEn       String?
-  description   String
-  descriptionEn String?
-  level         CourseLevel
-  category      CourseCategory
-  requiredTier  SubscriptionTier   @default(FREE)
-  duration      Int
-  lessons       Int                @default(0)
-  difficulty    Int                @default(1)
-  image         String?
-  price         Float?             @default(0)
-  thumbnail     String?
-  tags          String[]
-  isPublished   Boolean            @default(false)
-  rating        Float              @default(0)
-  enrolledCount Int                @default(0)
-  createdById   String
-  createdAt     DateTime           @default(now())
-  updatedAt     DateTime           @updatedAt
-  enrollments   CourseEnrollment[]
-  lessons_data  CourseLesson[]
-  createdBy     User               @relation("CourseCreator", fields: [createdById], references: [id])
-  progress      UserProgress[]
+  id                   String             @id @default(cuid())
+  title                String
+  titleEn              String?
+  description          String
+  descriptionEn        String?
+  level                CourseLevel
+  category             CourseCategory
+  requiredTier         SubscriptionTier   @default(FREE)
+  duration             Int
+  lessons              Int                @default(0)
+  difficulty           Int                @default(1)
+  image                String?
+  price                Float?             @default(0)
+  thumbnail            String?
+  tags                 String[]
+  isPublished          Boolean            @default(false)
+  rating               Float              @default(0)
+  enrolledCount        Int                @default(0)
+  availableLevels      Json?              // Array of CourseLevel values for multi-level courses
+  availableSubscriptions Json?            // Array of SubscriptionTier values for multi-tier access
+  createdById          String
+  createdAt            DateTime           @default(now())
+  updatedAt            DateTime           @updatedAt
+  enrollments          CourseEnrollment[]
+  lessons_data         CourseLesson[]
+  createdBy            User               @relation("CourseCreator", fields: [createdById], references: [id])
+  progress             UserProgress[]
 
   @@index([createdAt])
   @@index([isPublished, createdAt])

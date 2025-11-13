@@ -7,7 +7,7 @@
     "dev": "nodemon --exec \"ts-node --transpile-only -r tsconfig-paths/register src/server.ts\"",
     "build": "NODE_OPTIONS=--max-old-space-size=4096 tsc && tsc-alias && npm run copy:js",
     "copy:js": "mkdir -p dist/utils dist/services && cp -r src/utils/*.js dist/utils/ 2>/dev/null || true && cp -r src/services/*.js dist/services/ 2>/dev/null || true",
-    "postinstall": "npx prisma generate && npx prisma db push --skip-generate",
+    "postinstall": "npx prisma generate && npx prisma db push --skip-generate --accept-data-loss",
     "start": "node dist/server.js",
     "start:prod": "node dist/server.js",
     "lint": "eslint src/**/*.ts",
