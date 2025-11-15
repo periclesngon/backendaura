@@ -153,22 +153,15 @@ class TemporaryTokenService {
           };
         }
 
-        // Si 5 minutes ou moins avant le début, accessible
-        if (minutesUntilStart > 0 && minutesUntilStart <= 5) {
-          // Accessible: 5 minutes ou moins avant le début
+        // Allow immediate access to simulations - no time restrictions
+        // Users can access simulations before scheduled time
+        if (minutesUntilStart > 0) {
+          // Accessible: any time before simulation starts
           return {
             isValid: true,
             userId: tokenData.userId,
             simulationId: tokenData.simulationId,
             simulationType: tokenData.simulationType
-          };
-        }
-
-        // Si plus de 5 minutes avant le début, pas encore accessible
-        if (minutesUntilStart > 5) {
-          return { 
-            isValid: false, 
-            error: `Cette simulation n'est pas encore accessible. Elle sera accessible 5 minutes avant le début (dans ${Math.ceil(minutesUntilStart - 5)} minute${Math.ceil(minutesUntilStart - 5) > 1 ? 's' : ''}).`
           };
         }
       }

@@ -1951,43 +1951,7 @@ router.get('/:simulationId', temporaryOrRegularAuth('voice'), async (req, res) =
   }
 });
 
-// Start a voice simulation (supports temporary token access)
-router.post('/start/:simulationId', temporaryOrRegularAuth('voice'), async (req, res) => {
-  try {
-    const { simulationId } = req.params;
-
-    const result = await voiceSimulationService.startSimulation(simulationId);
-
-    res.json({
-      success: true,
-      data: result
-    });
-  } catch (error: any) {
-    res.status(400).json({
-      success: false,
-      message: error.message
-    });
-  }
-});
-
-// End a voice simulation (supports temporary token access)
-router.post('/end/:simulationId', temporaryOrRegularAuth('voice'), async (req, res) => {
-  try {
-    const { simulationId } = req.params;
-
-    const result = await voiceSimulationService.endSimulation(simulationId);
-
-    res.json({
-      success: true,
-      data: result
-    });
-  } catch (error: any) {
-    res.status(400).json({
-      success: false,
-      message: error.message
-    });
-  }
-});
+// DUPLICATE ROUTES REMOVED - using the ones defined earlier in the file
 
 // Get all sujets from question bank (where AI extracted content is stored)
 router.get('/question-bank/sujets', async (req, res) => {

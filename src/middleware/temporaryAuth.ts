@@ -228,19 +228,8 @@ export const simulationAccessMiddleware = (simulationType: 'voice' | 'immigratio
           }
         }
         
-        // Check if access is allowed (5 minutes before start)
-        const timeUntilStart = (scheduledDate.getTime() - now.getTime()) / (1000 * 60); // minutes until start
-        
-        if (timeUntilStart > 5) {
-          // Too early - deny access but return special code for waiting page
-          return res.status(403).json({
-            success: false,
-            message: `This link will be accessible 5 minutes before the simulation starts (in ${Math.ceil(timeUntilStart - 5)} minute${Math.ceil(timeUntilStart - 5) > 1 ? 's' : ''}).`,
-            code: 'TOO_EARLY',
-            minutesUntilAccessible: Math.ceil(timeUntilStart - 5),
-            scheduledDate: scheduledDate.toISOString()
-          });
-        }
+        // Allow immediate access to simulations - no time restrictions
+        // Users can access simulations as soon as they are created
       }
 
       if (!hasAccess) {

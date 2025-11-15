@@ -330,14 +330,27 @@ class VoiceSimulationService {
       let assistant;
       let call;
       try {
+        console.log('🎤 Creating VAPI assistant with voiceId:', voiceId);
         assistant = await vapiService.createFrenchAssistant(
           voiceId,
           progressiveQuestions
         );
+        console.log('✅ VAPI assistant created successfully:', assistant.id);
 
         // Start VAPI call with retry logic for rate limits
+        console.log('🎤 Starting VAPI voice simulation...');
         call = await vapiService.startVoiceSimulation(simulationId, assistant.id!);
+        console.log('✅ VAPI voice simulation started successfully:', call.id);
       } catch (vapiError: any) {
+        console.error('❌ VAPI Error Details:', {
+          message: vapiError.message,
+          stack: vapiError.stack,
+          response: vapiError.response?.data,
+          status: vapiError.response?.status,
+          simulationId,
+          voiceId
+        });
+        
         // If VAPI fails, revert simulation status to SCHEDULED
         await prisma.voiceSimulation.update({
           where: { id: simulationId },
@@ -346,8 +359,8 @@ class VoiceSimulationService {
         
         // Re-throw with more context
         throw new Error(
-          `Failed to start VAPI call: ${vapiError.message || 'Unknown error'}. ` +
-          `This may be due to rate limiting. Please try again in a moment.`
+          `🤖 Échec de création de l'assistant VAPI: ${vapiError.message || 'Erreur inconnue'}. ` +
+          `Cela peut être dû à une limitation de taux. Veuillez réessayer dans un moment.`
         );
       }
 
