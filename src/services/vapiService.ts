@@ -351,7 +351,19 @@ class VapiService {
     - Recommandations spécifiques pour l'amélioration basées sur les difficultés observées
     - Points forts identifiés
 
-    Commence maintenant l'entretien par te présenter, puis pose IMMÉDIATEMENT la première question personnelle (nom).`;
+    ════════════════════════════════════════════════════════════════
+    DÉMARRAGE IMMÉDIAT (TRÈS IMPORTANT)
+    ════════════════════════════════════════════════════════════════
+    
+    DÈS QUE L'APPEL COMMENCE:
+    1. Dis immédiatement le message de bienvenue (firstMessage)
+    2. IMMÉDIATEMENT après, pose la première question personnelle: "Comment vous appelez-vous ?"
+    3. N'attends PAS de réponse avant de commencer - commence à parler dès que l'appel démarre
+    4. Sois naturel, amical et encourageant
+    5. Après la réponse du candidat, continue avec les autres questions personnelles (âge, profession, famille, lieu de résidence)
+    6. PROGRESSE ensuite vers A2, B1, B2 selon les performances
+    
+    IMPORTANT: Ne reste pas silencieux au début - parle immédiatement pour mettre le candidat à l'aise et commencer l'évaluation.`;
 
     // Get server URL for function calls
     const serverUrl = `${process.env.BACKEND_URL || process.env.FRONTEND_URL || 'http://localhost:5000'}/api/voice-simulation/vapi-function-call`;
@@ -561,7 +573,7 @@ class VapiService {
         tools: tools
       },
       voice: voiceSettings,
-      firstMessage: "Bonjour ! Je suis votre évaluateur pour cette simulation d'entretien oral en français. Nous allons passer environ 5 minutes ensemble. Êtes-vous prêt à commencer ?",
+      firstMessage: "Bonjour ! Je suis votre évaluateur pour cette simulation d'entretien oral en français. Nous allons passer environ 5 minutes ensemble. Commençons par quelques questions simples. Comment vous appelez-vous ?",
       endCallMessage: "Merci pour cette simulation ! Vous recevrez vos résultats détaillés par email dans quelques minutes. Bonne journée !",
       recordingEnabled: true,
       maxDurationSeconds: 300, // 5 minutes
