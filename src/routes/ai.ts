@@ -34,12 +34,23 @@ const upload = multer({
       'application/pdf',
       'text/plain',
       'application/msword',
-      'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+      'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      // Audio types
+      'audio/mpeg',
+      'audio/mp3',
+      'audio/wav',
+      'audio/wave',
+      'audio/x-wav',
+      'audio/ogg',
+      'audio/webm',
+      'audio/mp4',
+      'audio/m4a',
+      'audio/x-m4a'
     ];
-    if (allowedTypes.includes(file.mimetype)) {
+    if (allowedTypes.includes(file.mimetype) || file.mimetype.startsWith('audio/')) {
       cb(null, true);
     } else {
-      cb(new Error('Invalid file type. Only PDF, TXT, DOC, and DOCX are allowed.'));
+      cb(new Error('Invalid file type. Only PDF, TXT, DOC, DOCX, and audio files (MP3, WAV, OGG, etc.) are allowed.'));
     }
   }
 });
@@ -1004,6 +1015,51 @@ router.post('/generate-questions-from-file', authenticate, upload.single('file')
       console.log('📝 Reading text file...');
       extractedText = fs.readFileSync(req.file.path, 'utf-8');
       console.log(`✅ Read ${extractedText.length} characters from text file`);
+    } else if (req.file.mimetype.startsWith('audio/')) {
+      // Handle audio files: upload to Cloudinary, then transcribe
+      console.log('🎤 Processing audio file...');
+      try {
+        // Import Cloudinary
+        const cloudinary = require('cloudinary').v2;
+        cloudinary.config({
+          cloud_name: process.env.CLOUDINARY_CLOUD_NAME || 'ddhhzeewn',
+          api_key: process.env.CLOUDINARY_API_KEY,
+          api_secret: process.env.CLOUDINARY_API_SECRET
+        });
+
+        // Upload audio to Cloudinary
+        const uploadResult = await cloudinary.uploader.upload(req.file.path, {
+          resource_type: 'video', // Cloudinary uses 'video' for audio files
+          folder: 'simulations/audio',
+          use_filename: true,
+          unique_filename: true
+        });
+
+        console.log('✅ Audio uploaded to Cloudinary:', uploadResult.secure_url);
+
+        // Transcribe audio using SpeechService
+        const { SpeechService } = await import('../services/speechService');
+        const audioBuffer = fs.readFileSync(req.file.path);
+        const transcriptionResult = await SpeechService.speechToText(audioBuffer);
+        
+        extractedText = transcriptionResult.transcription;
+        console.log(`✅ Transcribed ${extractedText.length} characters from audio (confidence: ${transcriptionResult.confidence})`);
+
+        // If transcription is empty or too short, try alternative method
+        if (!extractedText || extractedText.trim().length < 10) {
+          console.warn('⚠️ Transcription too short, trying alternative transcription method...');
+          // You could use OpenAI Whisper API or another service here
+          // For now, we'll use the audio URL and let AI generate questions based on metadata
+          extractedText = `Audio content from ${lessonTitle}. Please generate questions based on the audio transcript.`;
+        }
+      } catch (audioError: any) {
+        console.error('❌ Error processing audio file:', audioError);
+        fs.unlinkSync(req.file.path);
+        return res.status(500).json({
+          success: false,
+          error: `Failed to process audio file: ${audioError?.message || 'Unknown error'}`
+        });
+      }
     } else if (req.file.mimetype === 'application/msword' ||
                req.file.mimetype === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document') {
       // For Word documents, we would need a library like mammoth
@@ -1011,7 +1067,13 @@ router.post('/generate-questions-from-file', authenticate, upload.single('file')
       fs.unlinkSync(req.file.path);
       return res.status(400).json({
         success: false,
-        error: 'Word document support coming soon. Please use PDF or TXT files.'
+        error: 'Word document support coming soon. Please use PDF, TXT, or audio files.'
+      });
+    } else {
+      fs.unlinkSync(req.file.path);
+      return res.status(400).json({
+        success: false,
+        error: `Unsupported file type: ${req.file.mimetype}. Supported types: PDF, TXT, audio files (MP3, WAV, etc.)`
       });
     }
 
@@ -1019,7 +1081,7 @@ router.post('/generate-questions-from-file', authenticate, upload.single('file')
       fs.unlinkSync(req.file.path);
       return res.status(400).json({
         success: false,
-        error: 'Could not extract text from file'
+        error: 'Could not extract text from file. Please ensure the file contains readable content.'
       });
     }
 

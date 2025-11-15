@@ -133,7 +133,7 @@ router.get('/', authenticate, async (req: Request, res: Response, next: NextFunc
           }
         }
       },
-      orderBy: { createdAt: 'asc' }, // FIXED: Ascending order (oldest first, newest last - WhatsApp style)
+      orderBy: { createdAt: 'desc' }, // FIXED: Descending order (newest first) for admin, then frontend sorts appropriately
       take: parseInt(limit as string),
       skip: (parseInt(page as string) - 1) * parseInt(limit as string)
     });
@@ -576,8 +576,35 @@ router.get('/:id', authenticate, async (req: Request, res: Response, next: NextF
     if (message.receiverId === userId && !message.isRead) {
       await prisma.message.update({
         where: { id },
-        data: { isRead: true }
+        data: { 
+          isRead: true,
+          readAt: new Date()
+        }
       });
+      
+      // Mark related notifications as read
+      try {
+        await prisma.userNotification.updateMany({
+          where: {
+            userId: userId,
+            notification: {
+              data: {
+                path: ['messageId'],
+                equals: id
+              }
+            },
+            status: 'UNREAD'
+          },
+          data: {
+            status: 'READ',
+            readAt: new Date()
+          }
+        });
+        
+        console.log('✅ Message and related notifications marked as read:', { messageId: id, userId });
+      } catch (notifError) {
+        console.error('Failed to mark notifications as read:', notifError);
+      }
     }
 
     res.json({
@@ -689,7 +716,8 @@ router.put('/:id/read', authenticate, async (req: Request, res: Response, next: 
         receiverId: userId
       },
       data: {
-        isRead: true
+        isRead: true,
+        readAt: new Date()
       }
     });
 
@@ -698,6 +726,34 @@ router.put('/:id/read', authenticate, async (req: Request, res: Response, next: 
         success: false,
         error: { message: 'Message not found' }
       });
+    }
+
+    // Mark related notifications as read
+    try {
+      const updatedNotifications = await prisma.userNotification.updateMany({
+        where: {
+          userId: userId,
+          notification: {
+            data: {
+              path: ['messageId'],
+              equals: id
+            }
+          },
+          status: 'UNREAD'
+        },
+        data: {
+          status: 'READ',
+          readAt: new Date()
+        }
+      });
+      
+      console.log('✅ Message and notifications marked as read:', { 
+        messageId: id, 
+        userId, 
+        notificationsUpdated: updatedNotifications.count 
+      });
+    } catch (notifError) {
+      console.error('Failed to mark notifications as read:', notifError);
     }
 
     // Get the message details to broadcast read status
@@ -1894,13 +1950,38 @@ router.get('/validate-secure-session/:token', async (req: Request, res: Response
       })
     }
 
+    // Include both instructor and student in response for proper identification
+    const student = await prisma.user.findUnique({
+      where: { id: tokenValidation.studentId },
+      select: {
+        id: true,
+        firstName: true,
+        lastName: true,
+        profileImage: true,
+        role: true
+      }
+    })
+
     res.json({
       success: true,
       data: {
         sessionId: session.id,
         title: session.title,
         description: session.description,
-        instructor: session.createdBy,
+        instructor: {
+          id: session.createdBy.id,
+          firstName: session.createdBy.firstName,
+          lastName: session.createdBy.lastName,
+          profileImage: session.createdBy.profileImage,
+          role: 'INSTRUCTOR'
+        },
+        student: student ? {
+          id: student.id,
+          firstName: student.firstName,
+          lastName: student.lastName,
+          profileImage: student.profileImage,
+          role: student.role
+        } : undefined,
         duration: session.duration,
         status: session.status,
         secureToken: sanitizedToken

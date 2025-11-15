@@ -130,10 +130,10 @@ export class ContentManagementService {
             // Use Cloudinary duration if file extraction failed, otherwise use the more accurate file extraction
             if (!extractedDuration) {
               extractedDuration = cloudinaryDuration;
-              logger.info('Video duration extracted from Cloudinary', {
-                durationSeconds: uploadResult.duration,
-                durationMinutes: extractedDuration,
-                publicId: uploadResult.public_id
+          logger.info('Video duration extracted from Cloudinary', {
+            durationSeconds: uploadResult.duration,
+            durationMinutes: extractedDuration,
+            publicId: uploadResult.public_id
               });
             } else {
               // Log both for comparison
@@ -1286,32 +1286,32 @@ export class ContentManagementService {
 
       const subscriptionsFrench = backendSubscriptions.map(mapTierToFrench);
 
-      return {
-        id: updatedCourse.id,
-        title: updatedCourse.title,
-        description: updatedCourse.description,
+        return {
+          id: updatedCourse.id,
+          title: updatedCourse.title,
+          description: updatedCourse.description,
         level: backendLevels,
-        category: updatedCourse.category,
+          category: updatedCourse.category,
         subscriptionTier: backendSubscriptions as SubscriptionTier[],
-        contentType: updatedCourse.lessons_data.length > 0 && updatedCourse.lessons_data[0].videoUrl ? 'VIDEO' : 'NOTE',
-        fileUrl: updatedCourse.lessons_data.length > 0 ? updatedCourse.lessons_data[0].content : undefined,
-        thumbnailUrl: updatedCourse.thumbnail,
+          contentType: updatedCourse.lessons_data.length > 0 && updatedCourse.lessons_data[0].videoUrl ? 'VIDEO' : 'NOTE',
+          fileUrl: updatedCourse.lessons_data.length > 0 ? updatedCourse.lessons_data[0].content : undefined,
+          thumbnailUrl: updatedCourse.thumbnail,
         duration: realDuration,
         totalVideoCount,
-        tags: updatedCourse.tags,
-        isPublished: updatedCourse.isPublished,
+          tags: updatedCourse.tags,
+          isPublished: updatedCourse.isPublished,
         createdBy: {
           id: updatedCourse.createdBy.id,
           firstName: updatedCourse.createdBy.firstName,
           lastName: updatedCourse.createdBy.lastName,
           role: updatedCourse.createdBy.role
         },
-        createdAt: updatedCourse.createdAt,
+          createdAt: updatedCourse.createdAt,
         updatedAt: updatedCourse.updatedAt,
         levels: backendLevels,
         subscriptions: subscriptionsFrench as SubscriptionTier[],
         lessons_data: updatedCourse.lessons_data
-      };
+        };
     } catch (error) {
       logger.error('Error updating course levels and subscriptions:', error);
       throw error;

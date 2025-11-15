@@ -553,22 +553,97 @@ router.get('/:id', authenticate, async (req, res) => {
 router.post('/book', authenticate, async (req, res) => {
   try {
     const userId = (req as any).user?.userId || req.user.id;
-    const { bookingType, preferredDates, country, immigrationType, level, personalInfo, voicePreference } = req.body;
+    const { bookingType, preferredDates, country, immigrationType, level, personalInfo, voicePreference, questionsData } = req.body;
     const language = I18nService.getLanguageFromRequest(req);
+
+    console.log('📋 Immigration booking request:', {
+      userId,
+      bookingType,
+      preferredDates,
+      country,
+      immigrationType,
+      level,
+      voicePreference,
+      hasQuestionsData: !!questionsData
+    });
+
+    // Map country codes (CANADA -> canada)
+    const normalizedCountry = country?.toLowerCase() || 'canada';
+    
+    // Map frontend topics to backend immigration types based on country
+    // Frontend sends: 'immigration', 'school', 'work', 'relocation'
+    // Backend expects different types per country
+    let mappedImmigrationType = immigrationType;
+    
+    if (normalizedCountry === 'canada') {
+      const canadaMap: { [key: string]: string } = {
+        'immigration': 'skilled_worker',
+        'school': 'student',
+        'work': 'skilled_worker', // Work in Canada = skilled worker
+        'relocation': 'family_reunification',
+        'family': 'family_reunification'
+      };
+      mappedImmigrationType = canadaMap[immigrationType] || immigrationType || 'skilled_worker';
+    } else if (normalizedCountry === 'france') {
+      const franceMap: { [key: string]: string } = {
+        'immigration': 'work_permit',
+        'school': 'student',
+        'work': 'work_permit',
+        'relocation': 'family',
+        'family': 'family'
+      };
+      mappedImmigrationType = franceMap[immigrationType] || immigrationType || 'work_permit';
+    } else if (normalizedCountry === 'belgium') {
+      const belgiumMap: { [key: string]: string } = {
+        'immigration': 'work',
+        'school': 'student',
+        'work': 'work',
+        'relocation': 'student', // Belgium doesn't have family, use student as fallback
+        'family': 'student'
+      };
+      mappedImmigrationType = belgiumMap[immigrationType] || immigrationType || 'work';
+    } else {
+      // Default mapping for unknown countries
+      const defaultMap: { [key: string]: string } = {
+        'immigration': 'skilled_worker',
+        'school': 'student',
+        'work': 'work_permit',
+        'relocation': 'family_reunification',
+        'family': 'family_reunification'
+      };
+      mappedImmigrationType = defaultMap[immigrationType] || immigrationType || 'skilled_worker';
+    }
+    
+    // If already a valid backend type, keep it
+    const validTypes = ['skilled_worker', 'student', 'family_reunification', 'work_permit', 'work', 'family'];
+    if (validTypes.includes(immigrationType)) {
+      mappedImmigrationType = immigrationType;
+    }
+
+    console.log('🔄 Mapped values:', {
+      originalCountry: country,
+      normalizedCountry,
+      originalImmigrationType: immigrationType,
+      mappedImmigrationType
+    });
 
     // Create booking using the service
     const sessionData = {
-      country: country || 'canada',
-      immigrationType: immigrationType || 'skilled_worker',
+      country: normalizedCountry,
+      immigrationType: mappedImmigrationType,
       level: level || 'B1',
       personalInfo: personalInfo || {},
       voicePreference: voicePreference || 'france_female_1',
       bookingType: bookingType || 'AUTO',
       scheduledDate: preferredDates && preferredDates.length > 0 ? new Date(preferredDates[0]) : null,
-      questionsData: {}
+      questionsData: questionsData || {}
     };
 
+    console.log('📋 Session data prepared:', sessionData);
+    
     const simulation = await ImmigrationSimulationService.createImmigrationSession(userId, sessionData);
+    
+    console.log('✅ Simulation created successfully:', simulation?.id);
 
     res.json({
       success: true,
@@ -579,12 +654,33 @@ router.post('/book', authenticate, async (req, res) => {
     });
   } catch (error: any) {
     const language = I18nService.getLanguageFromRequest(req);
-    console.error('Error booking immigration simulation:', error);
+    
+    // Log FULL error details
+    console.error('❌ Error booking immigration simulation:', {
+      errorMessage: error?.message,
+      errorName: error?.name,
+      errorCode: error?.code,
+      errorStack: error?.stack,
+      userId: (req as any).user?.userId || req.user?.id,
+      requestBody: JSON.stringify(req.body, null, 2),
+      errorType: error?.constructor?.name,
+      isValidationError: error?.name === 'ValidationError',
+      fullError: JSON.stringify(error, Object.getOwnPropertyNames(error), 2)
+    });
+    
+    // Return detailed error message
+    const errorMessage = error?.message || (language === 'fr'
+      ? 'Erreur lors de la réservation'
+      : 'Error booking simulation');
+    
     res.status(400).json({
       success: false,
-      message: error.message || (language === 'fr'
-        ? 'Erreur lors de la réservation'
-        : 'Error booking simulation')
+      error: {
+        message: errorMessage,
+        code: error?.code || error?.name || 'BOOKING_ERROR',
+        details: error?.details || null
+      },
+      message: errorMessage
     });
   }
 });

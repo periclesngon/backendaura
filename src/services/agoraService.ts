@@ -15,7 +15,8 @@ export interface AgoraTokenResponse {
   token: string;
   appId: string;
   channelName: string;
-  uid: string | number;
+  uid: number; // Always numeric (converted from string if needed)
+  originalUid?: string | number; // Original UID for reference
   role: string;
   expiry: number;
   timestamp: number;
@@ -85,11 +86,27 @@ export class AgoraService {
       const privilegeExpiredTs = currentTime + expiry;
 
       // Generate token
+      // IMPORTANT: Agora RTC requires numeric UID (0 to 2^32-1)
+      // If string is provided, convert to number using hash, otherwise use the number directly
+      let numericUid: number;
+      if (typeof uid === 'string') {
+        // Convert string to numeric UID using hash function
+        let hash = 0;
+        for (let i = 0; i < uid.length; i++) {
+          const char = uid.charCodeAt(i);
+          hash = ((hash << 5) - hash) + char;
+          hash = hash & hash; // Convert to 32-bit integer
+        }
+        numericUid = Math.abs(hash) % 2147483647; // Ensure within valid range
+      } else {
+        numericUid = uid;
+      }
+      
       const token = RtcTokenBuilder.buildTokenWithUid(
         this.appId,
         this.appCertificate,
         channelName,
-        typeof uid === 'string' ? 0 : uid,
+        numericUid,
         agoraRole,
         privilegeExpiredTs,
         privilegeExpiredTs
@@ -97,7 +114,8 @@ export class AgoraService {
 
       logger.info('RTC token generated successfully', {
         channelName,
-        uid,
+        originalUid: uid,
+        numericUid: numericUid,
         role,
         expiry: privilegeExpiredTs
       });
@@ -106,7 +124,8 @@ export class AgoraService {
         token,
         appId: this.appId,
         channelName,
-        uid,
+        uid: numericUid, // Return numeric UID so frontend can use it for joining
+        originalUid: uid, // Keep original for reference
         role,
         expiry: privilegeExpiredTs,
         timestamp: currentTime

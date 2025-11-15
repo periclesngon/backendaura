@@ -103,24 +103,64 @@ router.get('/tutors', authenticate, async (req: Request, res: Response, next: Ne
       // OFFLINE = user has account but not online
       const displayStatus = tutor.status || 'OFFLINE'; // Use actual status from DB
       
+      // Get all marketplace profile data
+      const tutorLocation = marketplaceProfile.location || null;
+      const tutorTitle = marketplaceProfile.title || undefined;
+      const tutorPhone = marketplaceProfile.phone || undefined;
+      const tutorWebsite = marketplaceProfile.website || undefined;
+      const acceptsMessages = marketplaceProfile.acceptsMessages !== false; // Default to true
+      const tutorSubjects = Array.isArray(marketplaceProfile.subjects) 
+        ? marketplaceProfile.subjects 
+        : marketplaceProfile.subjects 
+        ? [marketplaceProfile.subjects] 
+        : [];
+      const tutorWorkingHours = Array.isArray(marketplaceProfile.workingHours)
+        ? marketplaceProfile.workingHours
+        : marketplaceProfile.workingHours
+        ? [marketplaceProfile.workingHours]
+        : [];
+      
       return {
         id: tutor.id,
-        name: `${tutor.firstName} ${tutor.lastName}`,
+        userId: tutor.id,
+        firstName: tutor.firstName || '',
+        lastName: tutor.lastName || '',
+        fullName: `${tutor.firstName || ''} ${tutor.lastName || ''}`.trim() || 'Formateur',
+        name: `${tutor.firstName || ''} ${tutor.lastName || ''}`.trim() || 'Formateur',
         email: tutor.email,
         role: tutor.role,
         profilePicture: tutor.profileImage || tutor.profilePicture, // Prioritize profileImage, fallback to profilePicture
+        profileImage: tutor.profileImage || tutor.profilePicture,
         bio: marketplaceProfile.bio || `Expert formateur en français langue étrangère`,
-        specialties: Array.isArray(marketplaceProfile.specialties) ? marketplaceProfile.specialties : ['Grammaire', 'Expression Orale'],
-        languages: Array.isArray(marketplaceProfile.languages) ? marketplaceProfile.languages : ['Français', 'English'],
-        availability: Array.isArray(marketplaceProfile.availability) ? marketplaceProfile.availability : ['Lun-Ven'],
-        location: marketplaceProfile.location || null,
+        title: tutorTitle,
+        phone: tutorPhone,
+        website: tutorWebsite,
+        specialties: Array.isArray(marketplaceProfile.specialties) 
+          ? marketplaceProfile.specialties 
+          : marketplaceProfile.specialties 
+          ? [marketplaceProfile.specialties] 
+          : [],
+        subjects: tutorSubjects,
+        languages: Array.isArray(marketplaceProfile.languages) 
+          ? marketplaceProfile.languages 
+          : marketplaceProfile.languages 
+          ? [marketplaceProfile.languages] 
+          : ['Français', 'English'],
+        availability: Array.isArray(marketplaceProfile.availability) 
+          ? marketplaceProfile.availability 
+          : marketplaceProfile.availability 
+          ? [marketplaceProfile.availability] 
+          : ['Lun-Ven'],
+        workingHours: tutorWorkingHours,
+        location: tutorLocation,
         experience: tutor.role === 'ADMIN' ? 'Expert' : 'Senior',
         rating: 4.5 + Math.random() * 0.5, // Mock rating
         reviewCount: Math.floor(Math.random() * 100) + 10,
         responseTime: '< 24h',
         isAvailable: true,
         status: displayStatus, // CRITICAL: Include status for frontend online/offline check
-        isActive: marketplaceProfile.isActive === true
+        isActive: marketplaceProfile.isActive === true,
+        acceptsMessages: acceptsMessages
       };
     });
 

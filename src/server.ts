@@ -291,6 +291,16 @@ server.listen(PORT, async () => {
   } catch (error) {
     console.error(`❌ Failed to start reminder scheduler:`, error);
   }
+
+  // Initialize live session status update cron job (auto-change to LIVE 5 minutes before)
+  try {
+    const { LiveSessionService } = await import('./services/liveSessionService');
+    LiveSessionService.initializeCronJobs();
+    console.log(`🔄 Live session status update cron job started`);
+    logger.info(`🔄 Live session status update cron job started`);
+  } catch (error) {
+    console.error(`❌ Failed to start live session cron job:`, error);
+  }
   
   logger.info(`🚀 Server running on port ${PORT}`);
   logger.info(`📊 Environment: ${config.nodeEnv}`);

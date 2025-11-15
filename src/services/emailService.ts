@@ -401,7 +401,20 @@ export class EmailService {
         attachments: options.attachments
       };
 
+      console.log('📧 EmailService.sendEmail: Attempting to send email...', {
+        to: options.to,
+        subject: options.subject,
+        from: mailOptions.from
+      });
+      
       const result = await this.transporter.sendMail(mailOptions);
+      
+      console.log('✅ EmailService.sendEmail: Email sent successfully!', {
+        to: options.to,
+        subject: options.subject,
+        messageId: result.messageId,
+        response: result.response
+      });
       
       logger.info('Email sent successfully', {
         to: options.to,
@@ -410,7 +423,16 @@ export class EmailService {
       });
 
       return true;
-    } catch (error) {
+    } catch (error: any) {
+      console.error('❌ EmailService.sendEmail: Failed to send email', {
+        to: options.to,
+        subject: options.subject,
+        error: error?.message,
+        code: error?.code,
+        command: error?.command,
+        response: error?.response
+      });
+      
       logger.error('Failed to send email', {
         to: options.to,
         subject: options.subject,

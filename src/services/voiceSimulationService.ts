@@ -4,6 +4,7 @@ import { EmailService } from './emailService';
 import I18nService, { Language } from './i18nService';
 import cron from 'node-cron';
 import axios from 'axios';
+const mistralApiManager = require('../utils/mistralApiManager');
 
 interface BookingRequest {
   userId: string;
@@ -148,18 +149,61 @@ class VoiceSimulationService {
       // Send confirmation email
       if (user) {
         try {
-        await this.sendBookingConfirmation({ ...simulation, user });
-          console.log('✅ Booking confirmation email sent successfully');
-        } catch (emailError: any) {
-          console.error('❌ Error sending booking confirmation email:', {
-            error: emailError?.message,
+          console.log('📧 Attempting to send booking confirmation email...', {
+            simulationId: simulation.id,
+            userEmail: user.email,
+            userName: `${user.firstName} ${user.lastName}`
+          });
+          
+          await this.sendBookingConfirmation({ ...simulation, user });
+          
+          console.log('✅ Booking confirmation email sent successfully', {
             simulationId: simulation.id,
             userEmail: user.email
           });
+        } catch (emailError: any) {
+          console.error('❌ CRITICAL: Error sending booking confirmation email:', {
+            error: emailError?.message,
+            stack: emailError?.stack,
+            simulationId: simulation.id,
+            userEmail: user.email,
+            errorName: emailError?.name,
+            errorCode: emailError?.code
+          });
+          
+          // Try to send a simple fallback email
+          try {
+            console.log('🔄 Attempting fallback email send...');
+            const { EmailService } = await import('./emailService');
+            const fallbackSent = await EmailService.sendEmail({
+              to: user.email,
+              subject: 'Confirmation de votre simulation vocale TCF/TEF',
+              html: `
+                <h2>Confirmation de réservation</h2>
+                <p>Bonjour ${user.firstName},</p>
+                <p>Votre simulation vocale a été réservée avec succès.</p>
+                <p><strong>Date:</strong> ${new Date(simulation.scheduledDate).toLocaleString('fr-FR')}</p>
+                <p><strong>ID Simulation:</strong> ${simulation.id}</p>
+                <p>Vous recevrez un rappel 30 minutes avant votre simulation.</p>
+              `
+            });
+            
+            if (fallbackSent) {
+              console.log('✅ Fallback email sent successfully');
+            } else {
+              console.error('❌ Fallback email also failed');
+            }
+          } catch (fallbackError: any) {
+            console.error('❌ Fallback email also failed:', fallbackError?.message);
+          }
+          
           // Don't fail the booking if email fails - just log the error
         }
       } else {
-        console.warn('⚠️ User not found, cannot send booking confirmation email');
+        console.warn('⚠️ User not found, cannot send booking confirmation email', {
+          simulationId: simulation.id,
+          userId: simulation.userId
+        });
       }
 
       return {
@@ -634,32 +678,44 @@ class VoiceSimulationService {
     try {
       console.log('📧 Preparing to send booking confirmation email...', {
         simulationId: simulation.id,
-        userEmail: simulation.user?.email
+        userEmail: simulation.user?.email,
+        hasUser: !!simulation.user
       });
+
+      if (!simulation.user || !simulation.user.email) {
+        throw new Error('User email is missing - cannot send confirmation email');
+      }
 
       // Générer un token temporaire sécurisé pour l'accès à la simulation
       // Token expires 2 minutes after simulation ends (when student/AI hangs up)
-      const { default: TemporaryTokenService } = await import('./temporaryTokenService');
-      
-      // Calculate estimated simulation end time (scheduledDate + duration)
-      const scheduledDate = new Date(simulation.scheduledDate);
-      const durationInSeconds = simulation.duration || 300; // 5 minutes default
-      const estimatedEndTime = new Date(scheduledDate.getTime() + durationInSeconds * 1000);
-      
-      // Token should be valid until 2 minutes after simulation ends
-      // We'll use a longer expiration window and validate at access time based on actual end time
-      const now = new Date();
-      const hoursUntilEstimatedEnd = Math.max(1, (estimatedEndTime.getTime() - now.getTime()) / (1000 * 60 * 60) + (2 / 60)); // Add 2 minutes buffer
-      
-      const temporaryToken = await TemporaryTokenService.generateToken(
-        simulation.userId,
-        simulation.id,
-        'voice',
-        hoursUntilEstimatedEnd // Valid until estimated end + 2 minutes (actual validation happens at access time)
-      );
+      let simulationUrl: string | undefined;
+      try {
+        const { default: TemporaryTokenService } = await import('./temporaryTokenService');
+        
+        // Calculate estimated simulation end time (scheduledDate + duration)
+        const scheduledDate = new Date(simulation.scheduledDate);
+        const durationInSeconds = simulation.duration || 300; // 5 minutes default
+        const estimatedEndTime = new Date(scheduledDate.getTime() + durationInSeconds * 1000);
+        
+        // Token should be valid until 2 minutes after simulation ends
+        const now = new Date();
+        const hoursUntilEstimatedEnd = Math.max(1, (estimatedEndTime.getTime() - now.getTime()) / (1000 * 60 * 60) + (2 / 60)); // Add 2 minutes buffer
+        
+        const temporaryToken = await TemporaryTokenService.generateToken(
+          simulation.userId,
+          simulation.id,
+          'voice',
+          hoursUntilEstimatedEnd
+        );
 
-      // Créer le lien d'accès sécurisé avec token
-      const simulationUrl = `${process.env.FRONTEND_URL || 'http://localhost:3000'}/simulation-vocale/${simulation.id}?token=${temporaryToken}`;
+        // Créer le lien d'accès sécurisé avec token
+        simulationUrl = `${process.env.FRONTEND_URL || 'http://localhost:3000'}/simulation-vocale/${simulation.id}?token=${temporaryToken}`;
+        console.log('✅ Temporary token generated for simulation access');
+      } catch (tokenError: any) {
+        console.warn('⚠️ Could not generate temporary token, using simple URL:', tokenError?.message);
+        // Fallback to simple URL without token
+        simulationUrl = `${process.env.FRONTEND_URL || 'http://localhost:3000'}/simulation-vocale/${simulation.id}`;
+      }
 
       // Get actual voice name from voice ID stored in questionsData
       let voiceDisplayName = simulation.voicePreference === 'MALE' ? 'Voix masculine' : 'Voix féminine';
@@ -667,18 +723,22 @@ class VoiceSimulationService {
         const questionsData = simulation.questionsData as any;
         const voiceId = questionsData.voiceId;
         if (voiceId) {
-          // Get voice name from vapiService
-          const { default: vapiService } = await import('./vapiService');
-          const availableVoices = vapiService.getVoiceOptions();
-          const voice = availableVoices.find(v => v.id === voiceId);
-          if (voice) {
-            voiceDisplayName = voice.name;
+          try {
+            // Get voice name from vapiService
+            const { default: vapiService } = await import('./vapiService');
+            const availableVoices = vapiService.getVoiceOptions();
+            const voice = availableVoices.find((v: any) => v.id === voiceId);
+            if (voice) {
+              voiceDisplayName = voice.name;
+            }
+          } catch (voiceError) {
+            console.warn('⚠️ Could not get voice name, using default:', voiceError);
           }
         }
       }
 
       const emailData = {
-        firstName: simulation.user.firstName,
+        firstName: simulation.user.firstName || 'Utilisateur',
         email: simulation.user.email,
         scheduledDate: new Date(simulation.scheduledDate),
         voicePreference: voiceDisplayName,
@@ -688,20 +748,34 @@ class VoiceSimulationService {
       };
 
       console.log('📧 Sending booking confirmation email to:', emailData.email);
+      console.log('📧 Email data prepared:', {
+        email: emailData.email,
+        firstName: emailData.firstName,
+        scheduledDate: emailData.scheduledDate.toISOString(),
+        simulationId: emailData.simulationId,
+        hasAccessUrl: !!emailData.accessUrl,
+        voicePreference: emailData.voicePreference
+      });
+      
+      // Use EmailService (already imported at top of file)
       const emailSent = await EmailService.sendVoiceSimulationBookingEmail(emailData);
       
       if (emailSent) {
         console.log('✅ Booking confirmation email sent successfully to:', emailData.email);
+        console.log('✅ Email sent with message ID (check logs for details)');
       } else {
-        console.error('❌ Failed to send booking confirmation email to:', emailData.email);
-        throw new Error('Email service returned false');
+        console.error('❌ CRITICAL: Email service returned false - email was NOT sent!');
+        console.error('❌ Email data that failed:', JSON.stringify(emailData, null, 2));
+        throw new Error('Email service returned false - email was not sent');
       }
     } catch (error: any) {
       console.error('❌ Error sending booking confirmation email:', {
         error: error?.message,
         stack: error?.stack,
         simulationId: simulation.id,
-        userEmail: simulation.user?.email
+        userEmail: simulation.user?.email,
+        errorName: error?.name,
+        errorCode: error?.code
       });
       throw error; // Re-throw to let caller handle
     }
@@ -1025,7 +1099,7 @@ class VoiceSimulationService {
         throw new Error('Active session not found');
       }
 
-      // Perform real-time analysis using OpenAI
+      // Perform real-time analysis using Mistral AI
       const analysis = await this.analyzeResponseRealTime(
         studentResponse,
         questionLevel,
@@ -1183,18 +1257,15 @@ class VoiceSimulationService {
     }
   }
 
-  // Real-time response analysis using OpenAI
+  // Real-time response analysis using Mistral AI
   private async analyzeResponseRealTime(
     studentResponse: string,
     questionLevel: string,
     conversationContext?: string
   ): Promise<any> {
-    const openaiApiKey = process.env.OPENAI_API_KEY;
-    if (!openaiApiKey) {
-      throw new Error('OpenAI API key not configured');
-    }
-
     try {
+      const systemPrompt = 'Tu es un expert en évaluation de français pour les tests TCF/TEF/FLS/FLE. Analyse les réponses en temps réel et fournis des évaluations précises et constructives. Réponds UNIQUEMENT avec un JSON valide, sans texte supplémentaire.';
+
       const analysisPrompt = `
 Analysez cette réponse d'un candidat à une question de niveau ${questionLevel} en français et fournissez une évaluation détaillée en temps réel.
 
@@ -1230,37 +1301,51 @@ RÉPONDEZ UNIQUEMENT avec un JSON dans ce format exact:
   "feedback": "Commentaire constructif et encourageant en français"
 }`;
 
-      const response = await axios.post(
-        'https://api.openai.com/v1/chat/completions',
-        {
-          model: 'gpt-4',
-          messages: [
-            {
-              role: 'system',
-              content: 'Tu es un expert en évaluation de français pour les tests TCF/TEF/FLS/FLE. Analyse les réponses en temps réel et fournis des évaluations précises et constructives.'
-            },
-            {
-              role: 'user',
-              content: analysisPrompt
-            }
-          ],
-          temperature: 0.3,
-          max_tokens: 800
-        },
-        {
-          headers: {
-            'Authorization': `Bearer ${openaiApiKey}`,
-            'Content-Type': 'application/json'
-          }
-        }
-      );
+      console.log('🤖 Using Mistral AI for voice simulation analysis...');
+      
+      const analysisText = await mistralApiManager.generateContent(analysisPrompt, {
+        systemPrompt: systemPrompt,
+        model: 'mistral-small-latest',
+        temperature: 0.3,
+        maxTokens: 800
+      });
 
-      const analysisText = response.data.choices[0].message.content;
-      const analysis = JSON.parse(analysisText);
+      // Clean the response - remove markdown code blocks if present
+      let cleanedText = analysisText.trim();
+      if (cleanedText.startsWith('```json')) {
+        cleanedText = cleanedText.replace(/```json\n?/g, '').replace(/```\n?/g, '');
+      } else if (cleanedText.startsWith('```')) {
+        cleanedText = cleanedText.replace(/```\n?/g, '');
+      }
 
+      // Parse JSON response
+      const analysis = JSON.parse(cleanedText);
+
+      // Validate required fields
+      if (!analysis.overallScore || !analysis.fluencyScore || !analysis.grammarScore ||
+          !analysis.vocabularyScore || !analysis.pronunciationScore || !analysis.coherenceScore) {
+        throw new Error('Invalid analysis response structure from Mistral AI');
+      }
+
+      console.log('✅ Mistral AI analysis completed successfully');
       return analysis;
     } catch (error: any) {
-      console.error('Error in real-time analysis:', error);
+      console.error('❌ Error in real-time analysis with Mistral AI:', error);
+      
+      // Try to extract JSON from error response if possible
+      if (error.message && error.message.includes('JSON')) {
+        try {
+          const jsonMatch = error.message.match(/\{[\s\S]*\}/);
+          if (jsonMatch) {
+            const analysis = JSON.parse(jsonMatch[0]);
+            console.log('✅ Extracted JSON from error response');
+            return analysis;
+          }
+        } catch (parseError) {
+          console.warn('⚠️ Could not parse JSON from error response');
+        }
+      }
+      
       // Return default analysis if error
       return {
         overallScore: 50,
@@ -1269,10 +1354,10 @@ RÉPONDEZ UNIQUEMENT avec un JSON dans ce format exact:
         vocabularyScore: 50,
         pronunciationScore: 50,
         coherenceScore: 50,
-        strengths: [],
-        weaknesses: [],
-        recommendations: [],
-        feedback: 'Analyse en cours...'
+        strengths: ['Analyse en cours...'],
+        weaknesses: ['Analyse en cours...'],
+        recommendations: ['Analyse en cours...'],
+        feedback: 'Analyse en cours de traitement...'
       };
     }
   }

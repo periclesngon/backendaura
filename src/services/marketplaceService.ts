@@ -107,10 +107,13 @@ export class MarketplaceService {
       const displayStatus = user.status || 'OFFLINE'; // Use actual status from DB
       
       // Get location from marketplace profile first, then user.city
-      const profileLocation = marketplaceProfile.location || user.city || null;
+      // Preserve empty strings - if location is "", keep it as ""
+      const profileLocation = marketplaceProfile.location !== undefined && marketplaceProfile.location !== null
+        ? marketplaceProfile.location
+        : (user.city || null);
       
-      // Check if tutor accepts messages from students
-      const acceptsMessages = marketplaceProfile.acceptsMessages !== false // Default to true
+      // Check if tutor accepts messages from students - explicitly check for true, default to false
+      const acceptsMessages = marketplaceProfile.acceptsMessages === true
       
       const profile: TutorProfile = {
         id: user.id,
@@ -118,10 +121,12 @@ export class MarketplaceService {
         firstName: user.firstName || '',
         lastName: user.lastName || '',
         fullName: fullName,
-        bio: marketplaceProfile.bio || user.bio || `Formateur expérimenté en français langue étrangère avec une expertise dans la préparation aux examens TCF/TEF.`,
-        title: marketplaceProfile.title || undefined, // Professional title
-        phone: marketplaceProfile.phone || undefined, // Phone number
-        website: marketplaceProfile.website || undefined, // Website URL
+        bio: marketplaceProfile.bio !== undefined && marketplaceProfile.bio !== null 
+          ? marketplaceProfile.bio 
+          : (user.bio || `Formateur expérimenté en français langue étrangère avec une expertise dans la préparation aux examens TCF/TEF.`),
+        title: marketplaceProfile.title !== undefined && marketplaceProfile.title !== null ? marketplaceProfile.title : undefined, // Professional title - preserve empty strings
+        phone: marketplaceProfile.phone !== undefined && marketplaceProfile.phone !== null ? marketplaceProfile.phone : undefined, // Phone number - preserve empty strings
+        website: marketplaceProfile.website !== undefined && marketplaceProfile.website !== null ? marketplaceProfile.website : undefined, // Website URL - preserve empty strings
         acceptsMessages: acceptsMessages, // Whether tutor accepts messages from students
         specialties: Array.isArray(marketplaceProfile.specialties) 
           ? marketplaceProfile.specialties 
@@ -623,21 +628,25 @@ export class MarketplaceService {
       }
 
       // Update marketplace profile in preferences
+      // CRITICAL: Save ALL fields even if they are empty strings or empty arrays
+      // This allows users to clear fields and have them persist
       const updatedPreferences = {
         ...currentPreferences,
         marketplaceProfile: {
           ...(currentPreferences.marketplaceProfile || {}),
+          // Always save these fields if they are provided (including empty strings)
+          // Use the value directly - preserve empty strings, don't convert with ||
           ...(updates.bio !== undefined && { bio: updates.bio }),
           ...(updates.acceptsMessages !== undefined && { acceptsMessages: updates.acceptsMessages }),
-          ...(updates.title !== undefined && { title: updates.title }), // Save title
-          ...(updates.phone !== undefined && { phone: updates.phone }), // Save phone
-          ...(updates.website !== undefined && { website: updates.website }), // Save website
-          ...(updates.location !== undefined && { location: updates.location }), // Always save location in marketplaceProfile
-          ...(updates.specialties !== undefined && { specialties: updates.specialties }),
-          ...(updates.subjects !== undefined && { subjects: updates.subjects }), // Save subjects (sujets)
-          ...(updates.languages !== undefined && { languages: updates.languages }),
-          ...(updates.availability !== undefined && { availability: updates.availability }), // Save working time periods (disponibilité)
-          ...(updates.workingHours !== undefined && { workingHours: updates.workingHours }) // Save working hours (specific time slots)
+          ...(updates.title !== undefined && { title: updates.title }), // Save title (preserve empty strings)
+          ...(updates.phone !== undefined && { phone: updates.phone }), // Save phone (preserve empty strings)
+          ...(updates.website !== undefined && { website: updates.website }), // Save website (preserve empty strings)
+          ...(updates.location !== undefined && { location: updates.location }), // Always save location (preserve empty strings)
+          ...(updates.specialties !== undefined && { specialties: Array.isArray(updates.specialties) ? updates.specialties : [] }),
+          ...(updates.subjects !== undefined && { subjects: Array.isArray(updates.subjects) ? updates.subjects : [] }), // Save subjects (sujets)
+          ...(updates.languages !== undefined && { languages: Array.isArray(updates.languages) ? updates.languages : [] }),
+          ...(updates.availability !== undefined && { availability: Array.isArray(updates.availability) ? updates.availability : [] }), // Save working time periods (disponibilité)
+          ...(updates.workingHours !== undefined && { workingHours: Array.isArray(updates.workingHours) ? updates.workingHours : [] }) // Save working hours (specific time slots)
         }
       };
       

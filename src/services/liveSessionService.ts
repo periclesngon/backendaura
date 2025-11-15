@@ -1,4 +1,4 @@
-import { prisma } from '@/database/connection';
+import { prisma } from '@/lib/prisma';
 import {
   NotFoundError,
   ValidationError,
@@ -14,6 +14,7 @@ import {
   PaginationParams,
   FilterParams
 } from '@/types';
+import cron from 'node-cron';
 
 
 
@@ -776,5 +777,112 @@ export class LiveSessionService {
     };
 
     return tierHierarchy[userTier] >= tierHierarchy[requiredTier];
+  }
+
+  /**
+   * Initialize cron jobs for automatic status updates
+   * This runs every minute to check for sessions that should change to LIVE 5 minutes before start
+   */
+  static initializeCronJobs(): void {
+    // Check every minute for sessions that should change to LIVE (5 minutes before start)
+    cron.schedule('* * * * *', async () => {
+      try {
+        const now = new Date();
+        const fiveMinutesFromNow = new Date(now.getTime() + 5 * 60 * 1000);
+        const sixMinutesFromNow = new Date(now.getTime() + 6 * 60 * 1000);
+
+        // Find sessions that are SCHEDULED and should be LIVE now (between 5-6 minutes before start)
+        const sessionsToActivate = await prisma.liveSession.findMany({
+          where: {
+            status: 'SCHEDULED',
+            date: {
+              gte: fiveMinutesFromNow,
+              lte: sixMinutesFromNow
+            }
+          },
+          include: {
+            participants: {
+              include: {
+                user: {
+                  select: {
+                    id: true,
+                    firstName: true,
+                    lastName: true,
+                    email: true
+                  }
+                }
+              }
+            }
+          }
+        });
+
+        if (sessionsToActivate.length > 0) {
+          logger.info(`🔄 Found ${sessionsToActivate.length} session(s) to activate (5 minutes before start)`);
+        }
+
+        for (const session of sessionsToActivate) {
+          try {
+            // Update status to LIVE
+            await prisma.liveSession.update({
+              where: { id: session.id },
+              data: { status: 'LIVE' }
+            });
+
+            logger.info(`✅ Session ${session.id} status changed to LIVE (5 minutes before start)`);
+
+            // Send reminder emails to all participants
+            const { EmailService } = await import('./emailService');
+            const sessionDate = new Date(session.date);
+
+            for (const participant of session.participants) {
+              try {
+                const emailData = {
+                  firstName: participant.user.firstName || 'Étudiant',
+                  email: participant.user.email,
+                  sessionTitle: session.title,
+                  sessionDate: sessionDate.toLocaleDateString('fr-FR', { 
+                    weekday: 'long', 
+                    year: 'numeric', 
+                    month: 'long', 
+                    day: 'numeric' 
+                  }),
+                  sessionTime: sessionDate.toLocaleTimeString('fr-FR', { 
+                    hour: '2-digit', 
+                    minute: '2-digit' 
+                  }),
+                  joinUrl: `${process.env.FRONTEND_URL || 'http://localhost:3000'}/live`,
+                  duration: session.duration || 60,
+                  reminderMinutes: 5
+                };
+
+                await EmailService.sendLiveSessionReminderEmail(emailData);
+                logger.info(`✅ Reminder email sent to ${participant.user.email} for session ${session.id}`);
+              } catch (error: any) {
+                logger.error(`❌ Failed to send reminder email to ${participant.user.email}:`, error);
+              }
+            }
+
+            // Mark status_change reminders as sent
+            await prisma.sessionReminder.updateMany({
+              where: {
+                sessionId: session.id,
+                reminderType: 'status_change',
+                emailSent: false
+              },
+              data: {
+                emailSent: true,
+                sentAt: new Date()
+              }
+            });
+          } catch (error: any) {
+            logger.error(`❌ Failed to activate session ${session.id}:`, error);
+          }
+        }
+      } catch (error: any) {
+        logger.error('❌ Error in live session cron job:', error);
+      }
+    });
+
+    logger.info('🕐 Live session status update cron job initialized (runs every minute)');
   }
 }

@@ -55,14 +55,14 @@ export class AiChatController {
           }
         })
       } else {
-        res.status(500).json({
-          success: false,
+      res.status(500).json({
+        success: false,
           error: { 
             message: 'Une erreur est survenue. Veuillez réessayer.',
             code: 'INTERNAL_ERROR',
             details: process.env.NODE_ENV === 'development' ? errorMessage : undefined
           }
-        })
+      })
       }
     }
   })
