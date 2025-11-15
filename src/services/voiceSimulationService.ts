@@ -281,7 +281,7 @@ class VoiceSimulationService {
 
       const simulation = result.simulation;
 
-      // Get progressive questions organized by level and category
+      // Get progressive questions organized by level and category (cached for performance)
       const progressiveQuestions = await vapiService.getProgressiveQuestions();
 
       // Get voice ID from questionsData (where we store the actual voice ID like 'france_male_1')
