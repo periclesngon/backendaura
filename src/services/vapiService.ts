@@ -557,20 +557,28 @@ class VapiService {
 
     OBJECTIF: Maximiser le nombre de questions posées (8-12 questions minimum) tout en maintenant une progression naturelle et adaptative.`;
 
+    // Simplified assistant configuration to avoid complex tool issues
     const assistant: VapiAssistant = {
       name: `TCF/TEF - ${selectedVoice.name}`,
       model: {
         provider: 'openai',
-        model: 'gpt-4',
+        model: 'gpt-3.5-turbo', // Use gpt-3.5-turbo instead of gpt-4 for better compatibility
         messages: [
           {
             role: 'system',
-            content: enhancedSystemPrompt
+            content: `Tu es un évaluateur d'entretien oral en français pour le TCF/TEF. 
+            
+DÉMARRAGE IMMÉDIAT:
+- Commence IMMÉDIATEMENT par dire: "Bonjour ! Je suis votre évaluateur pour cette simulation d'entretien oral en français. Nous allons passer environ 5 minutes ensemble. Commençons par quelques questions simples. Comment vous appelez-vous ?"
+- Pose des questions personnelles simples: nom, âge, profession, famille, lieu de résidence
+- Progresse graduellement selon les réponses: A1 → A2 → B1 → B2
+- Reste encourageant et bienveillant
+- L'entretien dure 5 minutes maximum`
           }
         ],
         temperature: 0.7,
-        maxTokens: 500,
-        tools: tools
+        maxTokens: 150
+        // Removed tools temporarily to fix 400 error
       },
       voice: voiceSettings,
       firstMessage: "Bonjour ! Je suis votre évaluateur pour cette simulation d'entretien oral en français. Nous allons passer environ 5 minutes ensemble. Commençons par quelques questions simples. Comment vous appelez-vous ?",
@@ -580,18 +588,41 @@ class VapiService {
       silenceTimeoutSeconds: 10,
       backgroundDenoisingEnabled: true,
       backchannelingEnabled: true,
-      clientMessages: ['transcript', 'hang', 'function-call'],
-      serverMessages: ['end-of-call-report', 'status-update', 'hang', 'function-call'],
-      serverUrl: serverUrl,
-      serverUrlSecret: serverUrlSecret
+      clientMessages: ['transcript', 'hang'],
+      serverMessages: ['end-of-call-report', 'status-update', 'hang']
+      // Removed serverUrl and serverUrlSecret temporarily
     };
 
     try {
+      console.log('🔑 VAPI API Key check:', this.config.apiKey ? 'SET' : 'MISSING');
+      console.log('🎤 Creating VAPI assistant with payload size:', JSON.stringify(assistant).length);
+      
       const response = await this.axiosInstance.post('/assistant', assistant);
+      console.log('✅ VAPI assistant created successfully:', response.data?.id);
       return response.data;
     } catch (error: any) {
-      console.error('Error creating VAPI assistant:', error.response?.data || error.message);
-      throw new Error(I18nService.t('voice.assistant_creation_failed', language));
+      console.error('❌ VAPI Error Details:', {
+        status: error.response?.status,
+        statusText: error.response?.statusText,
+        data: error.response?.data,
+        message: error.message,
+        config: {
+          method: error.config?.method,
+          url: error.config?.url,
+          hasAuth: !!error.config?.headers?.Authorization
+        }
+      });
+      
+      // Provide specific error message based on status
+      if (error.response?.status === 401) {
+        throw new Error('🔑 VAPI Authentication failed - Invalid API Key');
+      } else if (error.response?.status === 429) {
+        throw new Error('⏰ VAPI Rate limit exceeded - Please try again in a moment');
+      } else if (error.response?.status === 400) {
+        throw new Error(`🚨 VAPI Bad Request: ${error.response?.data?.message || 'Invalid assistant configuration'}`);
+      } else {
+        throw new Error(`🤖 Échec de création de l'assistant vocal: ${error.response?.data?.message || error.message}`);
+      }
     }
   }
 
