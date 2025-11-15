@@ -155,13 +155,24 @@ export class AgoraService {
         privilegeExpiredTs
       );
 
-      logger.info('RTM token generated successfully', { uid, expiry: privilegeExpiredTs });
+      // Convert string UID to numeric for consistency with AgoraTokenResponse interface
+      // Convert string to numeric UID using hash function
+      let hash = 0;
+      for (let i = 0; i < uid.length; i++) {
+        const char = uid.charCodeAt(i);
+        hash = ((hash << 5) - hash) + char;
+        hash = hash & hash; // Convert to 32-bit integer
+      }
+      const numericUid = Math.abs(hash) % 2147483647; // Ensure within valid range
+
+      logger.info('RTM token generated successfully', { uid, numericUid, expiry: privilegeExpiredTs });
 
       return {
         token,
         appId: this.appId,
         channelName: '',
-        uid,
+        uid: numericUid,
+        originalUid: uid,
         role: 'rtm_user',
         expiry: privilegeExpiredTs,
         timestamp: currentTime
