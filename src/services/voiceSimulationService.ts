@@ -138,82 +138,25 @@ class VoiceSimulationService {
         }
       });
 
-      // Get user data for confirmation email
-      const user = await prisma.user.findUnique({
-        where: { id: simulation.userId },
-        select: {
-          firstName: true,
-          lastName: true,
-          email: true
-        }
-      });
-
-      // Send confirmation email
-      if (user) {
-        try {
-          console.log('📧 Attempting to send booking confirmation email...', {
-            simulationId: simulation.id,
-            userEmail: user.email,
-            userName: `${user.firstName} ${user.lastName}`
-          });
-          
-          await this.sendBookingConfirmation({ ...simulation, user });
-          
-          console.log('✅ Booking confirmation email sent successfully', {
-            simulationId: simulation.id,
-            userEmail: user.email
-          });
-        } catch (emailError: any) {
-          console.error('❌ CRITICAL: Error sending booking confirmation email:', {
-            error: emailError?.message,
-            stack: emailError?.stack,
-            simulationId: simulation.id,
-            userEmail: user.email,
-            errorName: emailError?.name,
-            errorCode: emailError?.code
-          });
-          
-          // Try to send a simple fallback email
-          try {
-            console.log('🔄 Attempting fallback email send...');
-            const { EmailService } = await import('./emailService');
-            const fallbackSent = await EmailService.sendEmail({
-              to: user.email,
-              subject: 'Confirmation de votre simulation vocale TCF/TEF',
-              html: `
-                <h2>Confirmation de réservation</h2>
-                <p>Bonjour ${user.firstName},</p>
-                <p>Votre simulation vocale a été réservée avec succès.</p>
-                <p><strong>Date:</strong> ${new Date(simulation.scheduledDate).toLocaleString('fr-FR')}</p>
-                <p><strong>ID Simulation:</strong> ${simulation.id}</p>
-                <p>Vous recevrez un rappel 30 minutes avant votre simulation.</p>
-              `
-            });
-            
-            if (fallbackSent) {
-              console.log('✅ Fallback email sent successfully');
-            } else {
-              console.error('❌ Fallback email also failed');
-            }
-          } catch (fallbackError: any) {
-            console.error('❌ Fallback email also failed:', fallbackError?.message);
-          }
-          
-          // Don't fail the booking if email fails - just log the error
-        }
-      } else {
-        console.warn('⚠️ User not found, cannot send booking confirmation email', {
-          simulationId: simulation.id,
-          userId: simulation.userId
-        });
-      }
-
-      return {
+      // Return immediately - send email asynchronously (non-blocking)
+      const result = {
         booking,
         simulation,
         message: 'Voice simulation booked successfully',
         voiceId: voicePreference // Return voice ID for frontend
       };
+
+      // Send confirmation email asynchronously (don't wait for it)
+      this.sendBookingConfirmationAsync(simulation.id, simulation.userId).catch((emailError: any) => {
+        console.error('❌ Error sending booking confirmation email (async):', {
+          error: emailError?.message,
+          simulationId: simulation.id,
+          userId: simulation.userId
+        });
+        // Email failure doesn't affect booking success
+      });
+
+      return result;
     } catch (error: any) {
       console.error('❌ Error booking simulation:', {
         message: error?.message,
@@ -947,6 +890,85 @@ class VoiceSimulationService {
   }
 
   // Send booking confirmation email with secure access link
+  // Async email sending (non-blocking) - called after booking response is sent
+  private async sendBookingConfirmationAsync(simulationId: string, userId: string): Promise<void> {
+    try {
+      // Get user data for confirmation email
+      const user = await prisma.user.findUnique({
+        where: { id: userId },
+        select: {
+          firstName: true,
+          lastName: true,
+          email: true
+        }
+      });
+
+      if (!user) {
+        console.warn('⚠️ User not found, cannot send booking confirmation email', {
+          simulationId,
+          userId
+        });
+        return;
+      }
+
+      // Get simulation data
+      const simulation = await prisma.voiceSimulation.findUnique({
+        where: { id: simulationId }
+      });
+
+      if (!simulation) {
+        console.warn('⚠️ Simulation not found for email', { simulationId });
+        return;
+      }
+
+      console.log('📧 Sending booking confirmation email (async)...', {
+        simulationId,
+        userEmail: user.email,
+        userName: `${user.firstName} ${user.lastName}`
+      });
+      
+      await this.sendBookingConfirmation({ ...simulation, user });
+      
+      console.log('✅ Booking confirmation email sent successfully', {
+        simulationId,
+        userEmail: user.email
+      });
+    } catch (emailError: any) {
+      console.error('❌ Error sending booking confirmation email (async):', {
+        error: emailError?.message,
+        stack: emailError?.stack,
+        simulationId,
+        userId,
+        errorName: emailError?.name,
+        errorCode: emailError?.code
+      });
+      
+      // Try fallback email
+      try {
+        const user = await prisma.user.findUnique({
+          where: { id: userId },
+          select: { firstName: true, email: true }
+        });
+        
+        if (user) {
+          const { EmailService } = await import('./emailService');
+          await EmailService.sendEmail({
+            to: user.email,
+            subject: 'Confirmation de votre simulation vocale TCF/TEF',
+            html: `
+              <h2>Confirmation de réservation</h2>
+              <p>Bonjour ${user.firstName},</p>
+              <p>Votre simulation vocale a été réservée avec succès.</p>
+              <p><strong>ID Simulation:</strong> ${simulationId}</p>
+            `
+          });
+        }
+      } catch (fallbackError: any) {
+        console.error('❌ Fallback email also failed:', fallbackError?.message);
+      }
+    }
+  }
+
   private async sendBookingConfirmation(simulation: any): Promise<void> {
     try {
       console.log('📧 Preparing to send booking confirmation email...', {
