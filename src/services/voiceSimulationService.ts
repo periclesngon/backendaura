@@ -6,6 +6,8 @@ import cron from 'node-cron';
 import axios from 'axios';
 const mistralApiManager = require('../utils/mistralApiManager');
 
+const PROGRESSIVE_CACHE_TTL = 60 * 60 * 1000; // 1 hour cache per simulation
+
 interface BookingRequest {
   userId: string;
   bookingType: 'MANUAL' | 'AUTO';
@@ -249,12 +251,35 @@ class VoiceSimulationService {
       });
 
       if (!simulation) {
-        throw new Error('Simulation not found');
+        const error: any = new Error('Simulation not found');
+        error.statusCode = 404;
+        error.code = 'SIMULATION_NOT_FOUND';
+        throw error;
       }
 
-        // Check status atomically - prevents race conditions
-      if (simulation.status !== 'SCHEDULED') {
-          throw new Error(`Simulation is not in scheduled status. Current status: ${simulation.status}`);
+        // Check status - allow SCHEDULED or ACTIVE (in case it's already started)
+        if (simulation.status !== 'SCHEDULED' && simulation.status !== 'ACTIVE') {
+          const error: any = new Error(`Simulation cannot be started. Current status: ${simulation.status}`);
+          error.statusCode = 400;
+          error.code = 'INVALID_STATUS';
+          throw error;
+        }
+
+        // If already ACTIVE, just return the existing simulation (don't create duplicate assistant)
+        if (simulation.status === 'ACTIVE') {
+          console.log('✅ Simulation is already ACTIVE - returning existing session');
+          // Return with assistant info if available in questionsData
+          const questionsData = simulation.questionsData && typeof simulation.questionsData === 'object'
+            ? (simulation.questionsData as Record<string, any>)
+            : {};
+          const assistantId = typeof questionsData.assistantId === 'string' ? questionsData.assistantId.trim() : undefined;
+          const callId = simulation.vapiSessionId || `web-call-${simulationId}`;
+          
+          return { 
+            simulation,
+            ...(assistantId ? { assistant: { id: assistantId } } : {}),
+            ...(callId ? { call: { id: callId } } : {})
+          };
         }
 
         // Immediately update status to ACTIVE to prevent duplicate starts
@@ -270,8 +295,11 @@ class VoiceSimulationService {
         });
 
         if (!updatedSimulation) {
-          throw new Error('Simulation was already started by another request');
-      }
+          const error: any = new Error('Simulation was already started by another request');
+          error.statusCode = 409;
+          error.code = 'ALREADY_STARTED';
+          throw error;
+        }
 
         return { simulation: updatedSimulation };
       }, {
@@ -280,17 +308,47 @@ class VoiceSimulationService {
       });
 
       const simulation = result.simulation;
+      const existingQuestionsData = simulation.questionsData && typeof simulation.questionsData === 'object'
+        ? (simulation.questionsData as Record<string, any>)
+        : {};
+      const cachedAssistantId = typeof existingQuestionsData.assistantId === 'string'
+        ? existingQuestionsData.assistantId.trim()
+        : undefined;
+      const progressiveCache = existingQuestionsData.progressiveCache;
+      const cacheTimestamp = progressiveCache?.storedAt ? new Date(progressiveCache.storedAt).getTime() : 0;
+      const hasFreshProgressiveCache = Boolean(
+        progressiveCache?.data &&
+        cacheTimestamp &&
+        (Date.now() - cacheTimestamp) < PROGRESSIVE_CACHE_TTL
+      );
+      let progressiveQuestions = hasFreshProgressiveCache ? progressiveCache.data : null;
+      let fetchedProgressiveQuestions = false;
 
-      // Get progressive questions organized by level and category (cached for performance)
-      const progressiveQuestions = await vapiService.getProgressiveQuestions();
+      // If simulation is already ACTIVE, check if we have an existing session
+      if (simulation.status === 'ACTIVE') {
+        const existingSession = this.activeSessions.get(simulationId);
+        if (existingSession && existingSession.assistantId) {
+          console.log('✅ Returning existing ACTIVE simulation session');
+          return {
+            assistant: { id: existingSession.assistantId },
+            call: { id: existingSession.callId },
+            simulation
+          };
+        }
+        // If no session but status is ACTIVE, continue to create new assistant
+        console.log('⚠️ Simulation is ACTIVE but no session found - creating new assistant');
+      }
+
+      // Get user data for personalized greeting
+      const user = await prisma.user.findUnique({
+        where: { id: simulation.userId },
+        select: { firstName: true }
+      });
+      const studentName = user?.firstName || undefined;
 
       // Get voice ID from questionsData (where we store the actual voice ID like 'france_male_1')
       // voicePreference in DB is just MALE/FEMALE enum, but actual voice ID is in questionsData
-      let voiceId: string | undefined;
-      if (simulation.questionsData && typeof simulation.questionsData === 'object') {
-        const questionsData = simulation.questionsData as any;
-        voiceId = questionsData.voiceId;
-      }
+      let voiceId: string | undefined = existingQuestionsData.voiceId;
       
       // If no voice ID in questionsData, get random voice matching the gender preference
       if (!voiceId || typeof voiceId !== 'string' || !voiceId.includes('_')) {
@@ -310,58 +368,80 @@ class VoiceSimulationService {
         console.log(`🎲 Using ${matchingVoices.length > 0 ? 'gender-matched' : 'random'} voice:`, voiceId);
       }
 
-      // Store full progressive questions structure in simulation data
-      const questionsForStorage = {
-        personalInfo: progressiveQuestions.personalInfo,
-        byLevel: {
-          A1: progressiveQuestions.byLevel.A1.slice(0, 10), // Store sample for reference
-          A2: progressiveQuestions.byLevel.A2.slice(0, 10),
-          B1: progressiveQuestions.byLevel.B1.slice(0, 10),
-          B2: progressiveQuestions.byLevel.B2.slice(0, 10)
-        },
-        byCategory: Object.keys(progressiveQuestions.byCategory).reduce((acc, cat) => {
-          acc[cat] = progressiveQuestions.byCategory[cat].slice(0, 10);
-          return acc;
-        }, {} as Record<string, any[]>)
-      };
+      if (!progressiveQuestions) {
+        progressiveQuestions = await vapiService.getProgressiveQuestions();
+        fetchedProgressiveQuestions = true;
+      }
 
-      // Create VAPI assistant with progressive questions structure
-      // Wrap in try-catch to handle VAPI rate limits gracefully
-      let assistant;
+      // Create or reuse VAPI assistant with progressive questions structure and student name
+      let assistant: { id?: string };
       let call;
+      let createdNewAssistant = false;
       try {
-        console.log('🎤 Creating VAPI assistant with voiceId:', voiceId);
-        assistant = await vapiService.createFrenchAssistant(
-          voiceId,
-          progressiveQuestions
-        );
-        console.log('✅ VAPI assistant created successfully:', assistant.id);
+        if (cachedAssistantId) {
+          assistant = { id: cachedAssistantId };
+          console.log('♻️ Reusing cached assistant for simulation:', cachedAssistantId);
+        } else {
+          console.log('🎤 Creating VAPI assistant with voiceId:', voiceId, 'studentName:', studentName || 'not provided');
+          console.log('⏱️ This may take 6-8 seconds for first-time assistant creation...');
+          const startTime = Date.now();
+          assistant = await vapiService.createFrenchAssistant(
+            voiceId,
+            progressiveQuestions!,
+            'fr',
+            studentName
+          );
+          const duration = Date.now() - startTime;
+          createdNewAssistant = true;
+          console.log(`✅ VAPI assistant created successfully in ${duration}ms:`, assistant.id);
+        }
 
         // Start VAPI call with retry logic for rate limits
         console.log('🎤 Starting VAPI voice simulation...');
+        const callStartTime = Date.now();
         call = await vapiService.startVoiceSimulation(simulationId, assistant.id!);
-        console.log('✅ VAPI voice simulation started successfully:', call.id);
+        const callDuration = Date.now() - callStartTime;
+        console.log(`✅ VAPI voice simulation started successfully in ${callDuration}ms:`, call.id);
       } catch (vapiError: any) {
+        // Extract error details - handle both axios errors and regular Error objects
+        const statusFromProvider = vapiError.response?.status || vapiError.statusCode;
+        const errorMessage = vapiError.message || 'Erreur inconnue';
+        const providerMessage = vapiError.response?.data?.message || 
+                               vapiError.response?.data?.error || 
+                               errorMessage;
+        
         console.error('❌ VAPI Error Details:', {
-          message: vapiError.message,
+          message: errorMessage,
+          providerMessage: providerMessage,
           stack: vapiError.stack,
           response: vapiError.response?.data,
-          status: vapiError.response?.status,
+          status: statusFromProvider,
           simulationId,
-          voiceId
+          voiceId,
+          errorType: vapiError.constructor?.name,
+          hasResponse: !!vapiError.response
         });
         
         // If VAPI fails, revert simulation status to SCHEDULED
         await prisma.voiceSimulation.update({
           where: { id: simulationId },
           data: { status: 'SCHEDULED' }
+        }).catch(updateError => {
+          console.error('Failed to revert simulation status:', updateError);
         });
         
-        // Re-throw with more context
-        throw new Error(
-          `🤖 Échec de création de l'assistant VAPI: ${vapiError.message || 'Erreur inconnue'}. ` +
-          `Cela peut être dû à une limitation de taux. Veuillez réessayer dans un moment.`
-        );
+        // Create a proper error object with status code for route handler
+        // Use the actual error message from VAPI (which includes emoji prefixes like 🔑, 🚨, etc.)
+        const finalMessage = statusFromProvider === 429
+          ? `⏰ Limitation de taux VAPI: ${providerMessage}. Veuillez patienter quelques secondes avant de réessayer.`
+          : providerMessage; // Use the message directly from VAPI (already has emoji prefix)
+        
+        const error: any = new Error(finalMessage);
+        error.statusCode = statusFromProvider === 429 ? 429 : 400;
+        error.code = statusFromProvider === 429 ? 'RATE_LIMIT' : 'VAPI_ERROR';
+        error.providerMessage = providerMessage;
+        error.originalError = errorMessage;
+        throw error;
       }
 
       // Store session info with tracking
@@ -386,24 +466,85 @@ class VoiceSimulationService {
 
       this.activeSessions.set(simulationId, session);
 
-      // Update simulation with progressive questions data (status already ACTIVE from transaction)
-      await prisma.voiceSimulation.update({
-        where: { id: simulationId },
-        data: {
-          questionsData: questionsForStorage
-          // Status is already ACTIVE from the transaction above
-        }
-      });
+      const shouldPersistQuestionsData = createdNewAssistant || fetchedProgressiveQuestions || !existingQuestionsData.voiceId;
+      let questionsPayloadForResponse = existingQuestionsData;
+
+      if (shouldPersistQuestionsData) {
+        const sampleSource: any = progressiveQuestions || progressiveCache?.data;
+        const nowIso = new Date().toISOString();
+        const selectedVoice = vapiService.getVoiceOptions().find(v => v.id === voiceId);
+
+        const totalQuestionsCount: number = Object.values((sampleSource?.byLevel || {}) as Record<string, any>).reduce(
+          (count: number, arr: any) => count + (Array.isArray(arr) ? arr.length : 0),
+          0
+        );
+
+        const questionsForStorage = {
+          ...existingQuestionsData,
+          voiceId,
+          voiceName: selectedVoice?.name || existingQuestionsData.voiceName,
+          assistantId: assistant.id,
+          assistantCachedAt: nowIso,
+          lastAssistantSource: createdNewAssistant ? 'created' : 'reused',
+          ...(sampleSource
+            ? {
+                personalInfo: (sampleSource.personalInfo || []).slice(0, 10),
+                byLevel: {
+                  A1: (sampleSource.byLevel?.A1 || []).slice(0, 10),
+                  A2: (sampleSource.byLevel?.A2 || []).slice(0, 10),
+                  B1: (sampleSource.byLevel?.B1 || []).slice(0, 10),
+                  B2: (sampleSource.byLevel?.B2 || []).slice(0, 10)
+                },
+                byCategory: Object.keys(sampleSource.byCategory || {}).reduce((acc, cat) => {
+                  acc[cat] = (sampleSource.byCategory[cat] || []).slice(0, 10);
+                  return acc;
+                }, {} as Record<string, any[]>),
+                progressiveCache: {
+                  storedAt: nowIso,
+                  version: (existingQuestionsData.progressiveCache?.version || 0) + 1,
+                  totalQuestions: totalQuestionsCount,
+                  data: sampleSource
+                }
+              }
+            : {})
+        };
+
+        await prisma.voiceSimulation.update({
+          where: { id: simulationId },
+          data: {
+            questionsData: questionsForStorage
+            // Status is already ACTIVE from the transaction above
+          }
+        });
+
+        questionsPayloadForResponse = questionsForStorage;
+      }
 
       return {
         simulation,
         call,
         assistant,
-        questions: questionsForStorage,
+        questions: questionsPayloadForResponse,
         message: 'Voice simulation started successfully with progressive difficulty system'
       };
-    } catch (error) {
-      console.error('Error starting simulation:', error);
+    } catch (error: any) {
+      console.error('❌ Error starting simulation:', {
+        message: error?.message,
+        code: error?.code,
+        statusCode: error?.statusCode,
+        stack: error?.stack,
+        name: error?.name
+      });
+      
+      // Ensure error has proper structure for route handler
+      if (!error.statusCode && !error.code) {
+        const formattedError: any = new Error(error?.message || 'Failed to start simulation');
+        formattedError.statusCode = 500;
+        formattedError.code = 'INTERNAL_ERROR';
+        formattedError.originalError = error;
+        throw formattedError;
+      }
+      
       throw error;
     }
   }
@@ -411,63 +552,134 @@ class VoiceSimulationService {
   // End a voice simulation session
   async endSimulation(simulationId: string): Promise<any> {
     try {
+      // First, check if simulation exists in database
+      const simulation = await prisma.voiceSimulation.findUnique({
+        where: { id: simulationId }
+      });
+
+      if (!simulation) {
+        throw new Error('Simulation not found');
+      }
+
+      // Check if simulation is already completed
+      if (simulation.status === 'COMPLETED') {
+        console.log('Simulation already completed, returning existing results');
+        return {
+          results: simulation,
+          message: 'Simulation was already completed'
+        };
+      }
+
+      // Try to get session from activeSessions Map
       const session = this.activeSessions.get(simulationId);
-      if (!session) {
-        throw new Error('Active session not found');
+      
+      // If session exists in Map, use it for full processing
+      if (session) {
+        // End VAPI call if we have a callId
+        if (session.callId) {
+          try {
+            await vapiService.endCall(session.callId);
+          } catch (callError: any) {
+            console.warn('Error ending VAPI call (may already be ended):', callError.message);
+            // Don't throw - call might already be ended
+          }
+        }
+
+        // Process results if we have a callId
+        let results;
+        if (session.callId) {
+          try {
+            results = await vapiService.processCallResults(session.callId, simulationId);
+          } catch (processError: any) {
+            console.warn('Error processing call results:', processError.message);
+            // If processing fails, at least mark simulation as completed
+            results = await prisma.voiceSimulation.update({
+              where: { id: simulationId },
+              data: { status: 'COMPLETED' }
+            });
+          }
+        } else {
+          // No callId, just mark as completed
+          results = await prisma.voiceSimulation.update({
+            where: { id: simulationId },
+            data: { status: 'COMPLETED' }
+          });
+        }
+
+        // Remove from active sessions
+        this.activeSessions.delete(simulationId);
+
+        // Send results email
+        try {
+          await this.sendResultsEmail(results);
+        } catch (emailError: any) {
+          console.warn('Error sending results email:', emailError.message);
+          // Don't throw - email failure shouldn't prevent ending simulation
+        }
+
+        return {
+          results,
+          message: 'Voice simulation completed successfully'
+        };
+      } else {
+        // Session not in Map (backend restarted or session cleaned up)
+        // Still try to end the simulation gracefully
+        console.log('Session not found in activeSessions Map, ending simulation from database state');
+
+        // Try to get callId from simulation record
+        const callId = simulation.vapiSessionId;
+        
+        // Try to end VAPI call if we have a callId
+        if (callId && callId.startsWith('web-call-')) {
+          // Web calls are handled by frontend SDK, no need to end via API
+          console.log('Web call detected, skipping VAPI API end call');
+        } else if (callId) {
+          try {
+            await vapiService.endCall(callId);
+          } catch (callError: any) {
+            console.warn('Error ending VAPI call (may already be ended):', callError.message);
+            // Don't throw - call might already be ended
+          }
+        }
+
+        // Update simulation status to COMPLETED
+        const updatedSimulation = await prisma.voiceSimulation.update({
+          where: { id: simulationId },
+          data: { 
+            status: 'COMPLETED',
+            // If we have resultsData, keep it, otherwise set a basic completion message
+            ...(simulation.resultsData ? {} : {
+              resultsData: {
+                message: 'Simulation ended by user',
+                endedAt: new Date().toISOString()
+              }
+            })
+          }
+        });
+
+        // Try to send results email
+        try {
+          await this.sendResultsEmail(updatedSimulation);
+        } catch (emailError: any) {
+          console.warn('Error sending results email:', emailError.message);
+          // Don't throw - email failure shouldn't prevent ending simulation
+        }
+
+        return {
+          results: updatedSimulation,
+          message: 'Voice simulation ended successfully (session was not active)'
+        };
       }
-
-      // End VAPI call
-      if (session.callId) {
-        await vapiService.endCall(session.callId);
-      }
-
-      // Process results
-      const results = await vapiService.processCallResults(session.callId!, simulationId);
-
-      // Remove from active sessions
-      this.activeSessions.delete(simulationId);
-
-      // Send results email
-      await this.sendResultsEmail(results);
-
-      return {
-        results,
-        message: 'Voice simulation completed successfully'
-      };
-    } catch (error) {
+    } catch (error: any) {
       console.error('Error ending simulation:', error);
       throw error;
     }
   }
 
-  // Get a specific simulation
+  // Get a specific simulation (optimized for speed)
   async getSimulation(simulationId: string, userId: string): Promise<any> {
     try {
-      // First check if simulation exists at all (for better error messages)
-      const simulationExists = await prisma.voiceSimulation.findUnique({
-        where: { id: simulationId },
-        select: { id: true, userId: true }
-      });
-
-      if (!simulationExists) {
-        console.error('❌ Simulation not found in database:', {
-          simulationId,
-          userId
-        });
-        throw new Error('Simulation not found');
-      }
-
-      // Check if userId matches
-      if (simulationExists.userId !== userId) {
-        console.error('❌ User ID mismatch:', {
-          simulationId,
-          simulationUserId: simulationExists.userId,
-          requestUserId: userId
-        });
-        throw new Error('Access denied: This simulation belongs to a different user');
-      }
-
-      // Now fetch the full simulation with all data
+      // Single optimized query - fetch simulation with limited feedbacks (only latest 5)
       const simulation = await prisma.voiceSimulation.findFirst({
         where: {
           id: simulationId,
@@ -478,6 +690,7 @@ class VoiceSimulationService {
             orderBy: {
               createdAt: 'desc'
             },
+            take: 5, // Only load latest 5 feedbacks for faster response
             select: {
               id: true,
               aiScore: true,
@@ -496,6 +709,10 @@ class VoiceSimulationService {
       });
 
       if (!simulation) {
+        console.error('❌ Simulation not found or access denied:', {
+          simulationId,
+          userId
+        });
         throw new Error('Simulation not found or access denied');
       }
 
@@ -511,11 +728,29 @@ class VoiceSimulationService {
     try {
       console.log('📋 getUserSimulations: Fetching simulations for user:', userId);
       
-      // Fetch simulations ordered by scheduledDate, with createdAt as fallback
+      // OPTIMIZED: Fetch simulations with minimal includes and limit for performance
+      // Only fetch essential fields and limit to recent simulations
       const simulations = await prisma.voiceSimulation.findMany({
         where: { userId },
         orderBy: { scheduledDate: 'desc' },
-        include: {
+        take: 50, // Limit to 50 most recent simulations for performance
+        select: {
+          id: true,
+          scheduledDate: true,
+          voicePreference: true,
+          status: true,
+          overallScore: true,
+          fluencyScore: true,
+          grammarScore: true,
+          vocabularyScore: true,
+          pronunciationScore: true,
+          coherenceScore: true,
+          feedback: true,
+          duration: true,
+          createdAt: true,
+          updatedAt: true,
+          questionsData: true,
+          // Only get latest feedback for completed simulations
           aiFeedbacks: {
             orderBy: {
               createdAt: 'desc'

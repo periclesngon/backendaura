@@ -43,9 +43,9 @@ interface VapiAssistant {
   id?: string;
   name: string;
   model: {
-    provider: 'openai';
-    model: 'gpt-4' | 'gpt-3.5-turbo';
-    messages: Array<{
+    provider: 'openai' | 'mistral' | 'anthropic';
+    model: string; // Flexible model names for different providers
+    messages?: Array<{  // Optional - only needed for OpenAI
       role: 'system' | 'user' | 'assistant';
       content: string;
     }>;
@@ -66,8 +66,8 @@ interface VapiAssistant {
   backchannelingEnabled?: boolean;
   backgroundDenoisingEnabled?: boolean;
   modelOutputInMessagesEnabled?: boolean;
-  serverUrl?: string;
-  serverUrlSecret?: string;
+  // serverUrl?: string; // Removed
+  // serverUrlSecret?: string; // Removed
 }
 
 interface VapiCall {
@@ -110,6 +110,15 @@ class VapiService {
   private config: VapiConfig;
   private axiosInstance;
   private publicKey: string;
+  
+  // CACHE: Reuse assistants instead of creating new ones (prevents rate limiting)
+  private static assistantCache: Map<string, { id: string; createdAt: number }> = new Map();
+  private static readonly CACHE_DURATION = 7 * 24 * 60 * 60 * 1000; // 7 days
+  // Concurrency guard to prevent multiple creations in parallel for same voice
+  private static assistantCreationInProgress: Set<string> = new Set();
+  private static readonly MAX_CONCURRENT_CREATIONS = 2;
+  private static mistralConfigured = false;
+  private static mistralConfigPromise: Promise<boolean> | null = null;
 
   // Available French voices with proper accents (8 voices total)
   // Distribution: 3 France (2 male, 1 female), 3 Quebec (2 male, 1 female), 2 Belgium (1 male, 1 female)
@@ -193,12 +202,40 @@ class VapiService {
   ];
 
   constructor() {
+    const apiKey = process.env.VAPI_API_KEY || '70ad0f00-16dd-436f-ac9c-9e8dbced71dd';
+    const publicKey = process.env.VAPI_PUBLIC_KEY || 'cb1632e0-6256-45c2-93ca-798072bba18d';
+    
+    // Validate API key format (VAPI keys are typically UUIDs or start with specific prefixes)
+    if (!apiKey || apiKey.trim() === '') {
+      console.error('❌ CRITICAL: VAPI_API_KEY is missing or empty!');
+      console.error('   Please set VAPI_API_KEY in your .env file with a valid VAPI secret key');
+      throw new Error('VAPI_API_KEY is required but not set in environment variables');
+    }
+    
+    // Log API key prefix for debugging (first 8 chars + last 4 chars)
+    const keyPreview = apiKey.length > 12 
+      ? `${apiKey.substring(0, 8)}...${apiKey.substring(apiKey.length - 4)}`
+      : `${apiKey.substring(0, 4)}...`;
+    console.log(`🔑 VAPI API Key loaded: ${keyPreview}`);
+    
+    if (!publicKey || publicKey.trim() === '') {
+      console.warn('⚠️ WARNING: VAPI_PUBLIC_KEY is missing or empty!');
+      console.warn('   Frontend VAPI calls may fail. Please set VAPI_PUBLIC_KEY in your .env file');
+    } else {
+      const publicKeyPreview = publicKey.length > 12 
+        ? `${publicKey.substring(0, 8)}...${publicKey.substring(publicKey.length - 4)}`
+        : `${publicKey.substring(0, 4)}...`;
+      console.log(`🔑 VAPI Public Key loaded: ${publicKeyPreview}`);
+    }
+    
     this.config = {
-      apiKey: process.env.VAPI_API_KEY || '0d7d586a-e96e-43b4-84d5-3e9bfe238911',
+      // VAPI private API key (server-side only) - MUST be a SECRET key, not public key
+      apiKey: apiKey.trim(),
       baseUrl: process.env.VAPI_BASE_URL || 'https://api.vapi.ai'
     };
 
-    this.publicKey = process.env.VAPI_PUBLIC_KEY || 'cb1632e0-6256-45c2-93ca-798072bba18d';
+    // VAPI public key used by the Web SDK on the frontend
+    this.publicKey = publicKey.trim();
 
     this.axiosInstance = axios.create({
       baseURL: this.config.baseUrl,
@@ -207,11 +244,77 @@ class VapiService {
         'Content-Type': 'application/json'
       }
     });
+
+    // Auto-configure Mistral credentials on startup if MISTRAL_API_KEY is available
+    this.ensureMistralCredentials().catch(err => {
+      console.warn('⚠️ Failed to auto-configure Mistral credentials:', err.message);
+    });
   }
 
   // Get public key for frontend
   getPublicKey(): string {
     return this.publicKey;
+  }
+
+  // Configure Mistral API credentials in VAPI
+  // This is needed because VAPI requires provider credentials to be set in their dashboard
+  // We can add it programmatically via API
+  private async ensureMistralCredentials(): Promise<void> {
+    const mistralApiKey = process.env.MISTRAL_API_KEY;
+    if (!mistralApiKey || VapiService.mistralConfigured) {
+      return;
+    }
+
+    if (VapiService.mistralConfigPromise) {
+      await VapiService.mistralConfigPromise;
+      return;
+    }
+
+    VapiService.mistralConfigPromise = this.configureMistralCredentials(mistralApiKey)
+      .then((success) => {
+        if (success) {
+          VapiService.mistralConfigured = true;
+        }
+        return success;
+      })
+      .finally(() => {
+        VapiService.mistralConfigPromise = null;
+      });
+
+    try {
+      await VapiService.mistralConfigPromise;
+    } catch (error) {
+      console.warn('Failed to ensure Mistral credentials:', (error as any)?.message || error);
+    }
+  }
+
+  async configureMistralCredentials(mistralApiKey: string): Promise<boolean> {
+    try {
+      console.log('Configuring Mistral credentials in VAPI...');
+      
+      // VAPI API endpoint for adding provider credentials
+      // Based on VAPI docs: POST /credential
+      const response = await this.axiosInstance.post('/credential', {
+        provider: 'mistral',
+        apiKey: mistralApiKey
+      });
+      
+      console.log('Mistral credentials configured successfully in VAPI');
+      return true;
+    } catch (error: any) {
+      // If credential already exists, that's okay
+      if (error.response?.status === 409 || error.response?.status === 400) {
+        const errorMsg = error.response?.data?.message || '';
+        if (errorMsg.includes('already exists') || errorMsg.includes('duplicate')) {
+          console.log('Mistral credentials already configured in VAPI');
+          return true;
+        }
+      }
+      
+      console.error('Failed to configure Mistral credentials:', error.response?.data || error.message);
+      console.error('You may need to add it manually in VAPI dashboard under Settings → Provider Keys');
+      return false;
+    }
   }
 
   // Get available voice options
@@ -225,6 +328,7 @@ class VapiService {
   }
 
   // Create a French language assessment assistant with progressive difficulty
+  // CACHED: Reuses existing assistants to prevent rate limiting
   async createFrenchAssistant(
     voiceId: string, 
     progressiveQuestions: {
@@ -232,12 +336,89 @@ class VapiService {
       byLevel: { A1: any[]; A2: any[]; B1: any[]; B2: any[] };
       byCategory: Record<string, any[]>;
     },
-    language: Language = 'fr'
+    language: Language = 'fr',
+    studentName?: string
   ): Promise<VapiAssistant> {
     const selectedVoice = this.getVoiceById(voiceId);
     if (!selectedVoice) {
       throw new Error(I18nService.t('voice.voice_not_found', language));
     }
+
+    // CHECK CACHE FIRST - Reuse existing assistant to avoid rate limits
+    const cacheKey = `french_${voiceId}`;
+    const cached = VapiService.assistantCache.get(cacheKey);
+    const now = Date.now();
+    
+    if (cached && (now - cached.createdAt < VapiService.CACHE_DURATION)) {
+      console.log(`✅ Using CACHED assistant for voice ${voiceId}: ${cached.id}`);
+      // Trust cache to avoid extra API calls that can trigger rate limits
+      // BUT: We need to update the firstMessage with the student's name
+      // Since we can't update an existing assistant's firstMessage via API easily,
+      // we'll create a new assistant if studentName is provided and different
+      // For now, return cached assistant - the firstMessage will be set when assistant is actually used
+      // NOTE: VAPI will use the assistant's configured firstMessage, so we need to update it
+      const cachedAssistant = {
+        id: cached.id,
+        name: `TCF/TEF - ${selectedVoice.name}`,
+        model: { provider: 'mistral', model: 'mistral-small-latest' },
+        voice: { provider: '11labs', voiceId: selectedVoice.voiceId },
+        firstMessage: studentName 
+          ? `Bonjour ${studentName} ! Je suis votre évaluateur pour cette simulation d'entretien oral en français. Je me présente : je suis un assistant d'évaluation spécialisé dans les tests TCF/TEF. Nous allons passer environ 5 minutes ensemble pour évaluer votre niveau de français. Commençons par quelques questions simples. Comment vous appelez-vous ?`
+          : "Bonjour ! Je suis votre évaluateur pour cette simulation d'entretien oral en français. Je me présente : je suis un assistant d'évaluation spécialisé dans les tests TCF/TEF. Nous allons passer environ 5 minutes ensemble pour évaluer votre niveau de français. Commençons par quelques questions simples. Comment vous appelez-vous ?"
+      } as VapiAssistant;
+      
+      // If studentName is provided, we need to update the assistant's firstMessage
+      // Update the cached assistant's firstMessage via VAPI API
+      if (studentName) {
+        try {
+          console.log(`🔄 Updating cached assistant ${cached.id} with personalized greeting for ${studentName}`);
+          const personalizedFirstMessage = `Bonjour ${studentName} ! Je suis votre évaluateur pour cette simulation d'entretien oral en français. Je me présente : je suis un assistant d'évaluation spécialisé dans les tests TCF/TEF. Nous allons passer environ 5 minutes ensemble pour évaluer votre niveau de français. Commençons par quelques questions simples. Comment vous appelez-vous ?`;
+          
+          // Update assistant via VAPI API
+          await this.axiosInstance.patch(`/assistant/${cached.id}`, {
+            firstMessage: personalizedFirstMessage
+          });
+          
+          console.log(`✅ Updated assistant ${cached.id} with personalized greeting`);
+          return {
+            ...cachedAssistant,
+            firstMessage: personalizedFirstMessage
+          };
+        } catch (updateError: any) {
+          console.error(`❌ Failed to update assistant firstMessage:`, updateError.response?.data || updateError.message);
+          // If update fails, create new assistant to ensure personalized greeting
+          console.log(`⚠️ Creating new assistant instead due to update failure`);
+          // Continue to create new assistant below
+        }
+      } else {
+        return cachedAssistant;
+      }
+    }
+    
+    console.log(`🆕 Creating NEW assistant for voice ${voiceId} (cache miss or expired)`);
+    // Concurrency guard: avoid multiple creations for same voice
+    if (VapiService.assistantCreationInProgress.has(cacheKey)) {
+      console.log(`⏳ Assistant creation already in progress for ${voiceId}, waiting...`);
+      for (let i = 0; i < 20; i++) { // wait up to 10s
+        await new Promise(resolve => setTimeout(resolve, 500));
+        const ready = VapiService.assistantCache.get(cacheKey);
+        if (ready && !studentName) {
+          // Only use cached assistant if no studentName (to avoid hardcoded names)
+          console.log(`✅ Found cached assistant while waiting: ${ready.id}`);
+          return {
+            id: ready.id,
+            name: `TCF/TEF - ${selectedVoice.name}`,
+            model: { provider: 'mistral', model: 'mistral-small-latest' },
+            voice: { provider: '11labs', voiceId: selectedVoice.voiceId },
+            firstMessage: "Bonjour ! Je suis votre évaluateur pour cette simulation d'entretien oral en français. Je me présente : je suis un assistant d'évaluation spécialisé dans les tests TCF/TEF. Nous allons passer environ 5 minutes ensemble pour évaluer votre niveau de français. Commençons par quelques questions simples. Comment vous appelez-vous ?"
+          } as VapiAssistant;
+        }
+      }
+    }
+    if (VapiService.assistantCreationInProgress.size >= VapiService.MAX_CONCURRENT_CREATIONS) {
+      throw new Error('🚦 Too many concurrent assistant creations. Please try again in a moment.');
+    }
+    VapiService.assistantCreationInProgress.add(cacheKey);
 
     const voiceSettings: VoiceSettings = {
       provider: '11labs',
@@ -366,8 +547,9 @@ class VapiService {
     IMPORTANT: Ne reste pas silencieux au début - parle immédiatement pour mettre le candidat à l'aise et commencer l'évaluation.`;
 
     // Get server URL for function calls
-    const serverUrl = `${process.env.BACKEND_URL || process.env.FRONTEND_URL || 'http://localhost:5000'}/api/voice-simulation/vapi-function-call`;
-    const serverUrlSecret = process.env.VAPI_SERVER_URL_SECRET || 'vapi-secret-key';
+    // serverUrl disabled for local development to avoid VAPI https enforcement
+    // const serverUrl = `${process.env.BACKEND_URL || process.env.FRONTEND_URL || 'http://localhost:5000'}/api/voice-simulation/vapi-function-call`;
+    // const serverUrlSecret = process.env.VAPI_SERVER_URL_SECRET || 'vapi-secret-key';
 
     // Define VAPI tools (functions) for dynamic question fetching and response tracking
     const tools: VapiTool[] = [
@@ -557,51 +739,94 @@ class VapiService {
 
     OBJECTIF: Maximiser le nombre de questions posées (8-12 questions minimum) tout en maintenant une progression naturelle et adaptative.`;
 
-    // Simplified assistant configuration to avoid complex tool issues
+    // Ensure Mistral credentials are configured before creating assistant
+    await this.ensureMistralCredentials();
+
+    // Use Mistral (user has Mistral API key configured)
     const assistant: VapiAssistant = {
       name: `TCF/TEF - ${selectedVoice.name}`,
       model: {
-        provider: 'openai',
-        model: 'gpt-3.5-turbo', // Use gpt-3.5-turbo instead of gpt-4 for better compatibility
-        messages: [
-          {
-            role: 'system',
-            content: `Tu es un évaluateur d'entretien oral en français pour le TCF/TEF. 
-            
-DÉMARRAGE IMMÉDIAT:
-- Commence IMMÉDIATEMENT par dire: "Bonjour ! Je suis votre évaluateur pour cette simulation d'entretien oral en français. Nous allons passer environ 5 minutes ensemble. Commençons par quelques questions simples. Comment vous appelez-vous ?"
-- Pose des questions personnelles simples: nom, âge, profession, famille, lieu de résidence
-- Progresse graduellement selon les réponses: A1 → A2 → B1 → B2
-- Reste encourageant et bienveillant
-- L'entretien dure 5 minutes maximum`
-          }
-        ],
+        provider: 'mistral',
+        model: 'mistral-small-latest',
         temperature: 0.7,
-        maxTokens: 150
-        // Removed tools temporarily to fix 400 error
+        maxTokens: 1500
       },
-      voice: voiceSettings,
-      firstMessage: "Bonjour ! Je suis votre évaluateur pour cette simulation d'entretien oral en français. Nous allons passer environ 5 minutes ensemble. Commençons par quelques questions simples. Comment vous appelez-vous ?",
-      endCallMessage: "Merci pour cette simulation ! Vous recevrez vos résultats détaillés par email dans quelques minutes. Bonne journée !",
+      voice: {
+        provider: '11labs',
+        voiceId: selectedVoice.voiceId,
+        speed: 1.0
+      },
+      firstMessage: studentName 
+        ? `Bonjour ${studentName} ! Je suis votre évaluateur pour cette simulation d'entretien oral en français. Je me présente : je suis un assistant d'évaluation spécialisé dans les tests TCF/TEF. Nous allons passer environ 5 minutes ensemble pour évaluer votre niveau de français. Commençons par quelques questions simples. Comment vous appelez-vous ?`
+        : "Bonjour ! Je suis votre évaluateur pour cette simulation d'entretien oral en français. Je me présente : je suis un assistant d'évaluation spécialisé dans les tests TCF/TEF. Nous allons passer environ 5 minutes ensemble pour évaluer votre niveau de français. Commençons par quelques questions simples. Comment vous appelez-vous ?",
       recordingEnabled: true,
-      maxDurationSeconds: 300, // 5 minutes
-      silenceTimeoutSeconds: 10,
-      backgroundDenoisingEnabled: true,
-      backchannelingEnabled: true,
-      clientMessages: ['transcript', 'hang'],
-      serverMessages: ['end-of-call-report', 'status-update', 'hang']
-      // Removed serverUrl and serverUrlSecret temporarily
+      silenceTimeoutSeconds: 30,
+      maxDurationSeconds: 600,
+      clientMessages: ['conversation-update', 'hang', 'speech-update'],
+      serverMessages: ['conversation-update', 'end-of-call-report', 'hang']
     };
 
+    // Retry logic with backoff for rate limits
+    const maxRetries = 2;
+    let lastError: any = null;
+    
     try {
-      console.log('🔑 VAPI API Key check:', this.config.apiKey ? 'SET' : 'MISSING');
-      console.log('🎤 Creating VAPI assistant with payload size:', JSON.stringify(assistant).length);
-      
+      for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+          const apiKeyPreview = this.config.apiKey ? `${this.config.apiKey.substring(0, 8)}...` : 'MISSING';
+          console.log(`VAPI API Key: ${apiKeyPreview} | Attempt ${attempt}/${maxRetries}`);
+          console.log('Creating assistant (Mistral)');
+          
+          const rateLimitDelay = Number(process.env.VAPI_RATE_LIMIT_DELAY || '0');
+          if (rateLimitDelay > 0) {
+            await new Promise(r => setTimeout(r, rateLimitDelay));
+          }
+          
       const response = await this.axiosInstance.post('/assistant', assistant);
-      console.log('✅ VAPI assistant created successfully:', response.data?.id);
+          const assistantId = response.data?.id;
+          console.log('✅ VAPI assistant created successfully:', assistantId);
+          
+          // CACHE the assistant for reuse (prevents rate limiting)
+          if (assistantId) {
+            VapiService.assistantCache.set(cacheKey, {
+              id: assistantId,
+              createdAt: Date.now()
+            });
+            console.log(`💾 Cached assistant ${assistantId} for voice ${voiceId}`);
+          }
+          
       return response.data;
     } catch (error: any) {
-      console.error('❌ VAPI Error Details:', {
+          lastError = error;
+          const status = error.response?.status;
+          const isRateLimit = status === 429;
+          console.error(`❌ Assistant creation failed (attempt ${attempt}/${maxRetries})`, {
+            status,
+            message: error.response?.data?.message || error.message,
+            data: error.response?.data
+          });
+          if (status === 400 || status === 401) {
+            console.error('🛑 Non-retryable error, aborting retries');
+            throw error;
+          }
+          const isRetryable = isRateLimit || status === 500 || status === 503;
+          
+          if (isRetryable && attempt < maxRetries) {
+            const delay = 2000 * attempt; // Linear backoff: 2s, 4s
+            console.log(`⏰ Retryable error (${status}), retrying in ${delay}ms...`);
+            await new Promise(resolve => setTimeout(resolve, delay));
+            continue;
+          }
+          
+          // If not retryable or last attempt, throw error
+          throw error;
+        }
+      }
+      
+      // Should never reach here, but just in case
+      throw lastError;
+    } catch (error: any) {
+      const errorDetails = {
         status: error.response?.status,
         statusText: error.response?.statusText,
         data: error.response?.data,
@@ -609,20 +834,28 @@ DÉMARRAGE IMMÉDIAT:
         config: {
           method: error.config?.method,
           url: error.config?.url,
-          hasAuth: !!error.config?.headers?.Authorization
+          hasAuth: !!error.config?.headers?.Authorization,
+          payload: error.config?.data ? JSON.parse(error.config.data) : null
         }
-      });
+      };
+      
+      console.error('❌ VAPI Error Details (FULL):', JSON.stringify(errorDetails, null, 2));
+      console.error('❌ VAPI Error Response Data:', error.response?.data);
+      console.error('❌ VAPI Error Message:', error.message);
       
       // Provide specific error message based on status
       if (error.response?.status === 401) {
-        throw new Error('🔑 VAPI Authentication failed - Invalid API Key');
+        throw new Error('VAPI Authentication failed - Invalid API Key');
       } else if (error.response?.status === 429) {
-        throw new Error('⏰ VAPI Rate limit exceeded - Please try again in a moment');
+        throw new Error('VAPI Rate limit exceeded - Please try again in a moment');
       } else if (error.response?.status === 400) {
-        throw new Error(`🚨 VAPI Bad Request: ${error.response?.data?.message || 'Invalid assistant configuration'}`);
+        const errorMsg = error.response?.data?.message || error.response?.data?.error || JSON.stringify(error.response?.data);
+        throw new Error(`Failed to create VAPI assistant: ${errorMsg}`);
       } else {
-        throw new Error(`🤖 Échec de création de l'assistant vocal: ${error.response?.data?.message || error.message}`);
+        throw new Error(`Failed to create Mistral assistant: ${error.response?.data?.message || error.message}`);
       }
+    } finally {
+      VapiService.assistantCreationInProgress.delete(cacheKey);
     }
   }
 
@@ -724,8 +957,9 @@ DÉMARRAGE IMMÉDIAT:
     IMPORTANT: Commence par des questions personnelles simples !`;
 
     // Get server URL for function calls (immigration simulation uses same endpoint but different logic)
-    const serverUrl = `${process.env.BACKEND_URL || process.env.FRONTEND_URL || 'http://localhost:5000'}/api/voice-simulation/vapi-function-call`;
-    const serverUrlSecret = process.env.VAPI_SERVER_URL_SECRET || 'vapi-secret-key';
+    // serverUrl disabled for local development to avoid VAPI https enforcement
+    // const serverUrl = `${process.env.BACKEND_URL || process.env.FRONTEND_URL || 'http://localhost:5000'}/api/voice-simulation/vapi-function-call`;
+    // const serverUrlSecret = process.env.VAPI_SERVER_URL_SECRET || 'vapi-secret-key';
 
     // Define VAPI tools (functions) for dynamic question fetching and response tracking
     const tools: VapiTool[] = [
@@ -887,8 +1121,7 @@ DÉMARRAGE IMMÉDIAT:
       silenceTimeoutSeconds: 30,
       clientMessages: ['conversation-update', 'function-call', 'hang', 'speech-update'],
       serverMessages: ['conversation-update', 'end-of-call-report', 'hang', 'speech-update'],
-      serverUrl: serverUrl,
-      serverUrlSecret: serverUrlSecret
+      // serverUrl/serverUrlSecret removed to avoid VAPI 400 in local (http)
     };
 
     try {

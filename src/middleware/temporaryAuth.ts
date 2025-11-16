@@ -256,16 +256,28 @@ export const simulationAccessMiddleware = (simulationType: 'voice' | 'immigratio
  */
 export const temporaryOrRegularAuth = (simulationType: 'voice' | 'immigration') => {
   return async (req: Request, res: Response, next: NextFunction) => {
+    console.log('🔐 temporaryOrRegularAuth middleware called', {
+      method: req.method,
+      path: req.path,
+      simulationType,
+      hasQueryToken: !!req.query.token,
+      hasXToken: !!req.headers['x-token'],
+      hasAuthHeader: !!req.headers.authorization
+    });
+    
     // Check if there's a temporary token in query or x-token header (NOT authorization header)
     const tempToken = (req.query.token as string) || (req.headers['x-token'] as string);
     
     if (tempToken) {
+      console.log('🔑 Temporary token found, using temporary auth');
       // Try temporary auth first
       await temporaryAuthMiddleware(req, res, async () => {
         // If temporary auth succeeded, proceed with simulation access check
         if (req.user || req.temporaryAuth) {
+          console.log('✅ Temporary auth succeeded, checking simulation access');
           await simulationAccessMiddleware(simulationType)(req, res, next);
         } else {
+          console.log('⚠️ Temporary auth failed, trying regular auth');
           // Temporary token was invalid, try regular auth
           const { authenticate } = await import('./auth');
           // authenticate is synchronous, wrap it properly
@@ -276,10 +288,12 @@ export const temporaryOrRegularAuth = (simulationType: 'voice' | 'immigration') 
         }
       });
     } else {
+      console.log('🔑 No temporary token, using regular JWT authentication');
       // No temporary token, use regular authentication (JWT from Authorization header)
       const { authenticate } = await import('./auth');
       // authenticate is synchronous, wrap it properly
       authenticate(req, res, () => {
+        console.log('✅ Regular auth completed, checking simulation access');
         // After authentication succeeds, proceed with simulation access check
         simulationAccessMiddleware(simulationType)(req, res, next);
       });

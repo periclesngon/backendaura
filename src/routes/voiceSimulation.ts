@@ -1894,20 +1894,55 @@ router.get('/:simulationId', temporaryOrRegularAuth('voice'), async (req, res) =
 
 // Start a voice simulation (supports temporary token access)
 router.post('/start/:simulationId', temporaryOrRegularAuth('voice'), async (req, res) => {
+  console.log('✅ POST /start/:simulationId - Request received', {
+    simulationId: req.params.simulationId,
+    hasUser: !!req.user,
+    hasTemporaryAuth: !!req.temporaryAuth,
+    method: req.method,
+    url: req.url
+  });
+  
   try {
     const { simulationId } = req.params;
+    console.log('🎯 Starting simulation:', simulationId);
 
     const result = await voiceSimulationService.startSimulation(simulationId);
+    console.log('✅ Simulation started successfully:', result.assistant?.id);
 
     res.json({
       success: true,
       data: result
     });
   } catch (error: any) {
-    res.status(400).json({
-      success: false,
-      message: error.message
+    // Check if it's a rate limit error (429)
+    const statusCode = error.statusCode || (error.code === 'RATE_LIMIT' ? 429 : 400);
+    const errorCode = error.code || 'VAPI_ERROR';
+    const errorMessage = error.message || 'Failed to start simulation';
+    
+    console.error('❌ Error starting voice simulation:', {
+      simulationId: req.params.simulationId,
+      statusCode,
+      errorCode,
+      errorMessage,
+      providerMessage: error.providerMessage,
+      stack: error.stack
     });
+    
+    // Ensure we always return a properly formatted error response
+    const errorResponse = {
+      success: false,
+      code: errorCode,
+      message: errorMessage,
+      error: {
+        message: errorMessage,
+        code: errorCode
+      },
+      ...(error.providerMessage && { providerMessage: error.providerMessage })
+    };
+    
+    console.log('📤 Sending error response:', JSON.stringify(errorResponse, null, 2));
+    
+    res.status(statusCode).json(errorResponse);
   }
 });
 
