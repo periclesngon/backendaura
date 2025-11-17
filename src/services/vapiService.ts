@@ -1,5 +1,5 @@
 import axios from 'axios';
-import { prisma } from '@/database/connection';
+import { prisma } from '@/lib/prisma';
 import I18nService, { Language } from './i18nService';
 
 interface VapiConfig {
